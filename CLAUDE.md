@@ -8,7 +8,7 @@ The ultimate goal is a GPU-accelerated FEM solver using Nvidia's `warp.fem` fram
 
 ## Current State (as of March 2026)
 
-### What's Done: Pure-NumPy Reference Implementation
+### What's Done: Warp.fem GPU Implementation + Pure-NumPy Reference
 
 A complete, working FEM solver using only numpy + scipy:
 
@@ -22,11 +22,11 @@ A complete, working FEM solver using only numpy + scipy:
 
 - **`src/tmswarp/fields.py`** — Post-processing: `compute_efield_at_elements()` (E = -grad(phi) - dA/dt), plus `rdm()` and `mag()` validation metrics.
 
-### Test Results: 20 passed, 1 skipped
+### Test Results: 28 passed
 
-All tests pass. The FEM validates against the analytical solution:
-- **RDM = 0.192** (threshold < 0.2) — directional accuracy
-- **MAG = 0.019** (threshold < log(1.1) = 0.095) — magnitude accuracy
+All tests pass. Both FEM solvers validate against the analytical solution:
+- **NumPy FEM**: RDM = 0.192 (threshold < 0.2), MAG = 0.019 (threshold < log(1.1))
+- **Warp.fem**: RDM = 0.230 (threshold < 0.3 due to float32 geometry), MAG = 0.027
 
 These thresholds match SimNIBS's own validation criteria.
 
@@ -42,13 +42,37 @@ These thresholds match SimNIBS's own validation criteria.
 
 The slow RDM convergence is due to Delaunay mesh quality (slivers, irregular elements). With proper meshes (e.g., from SimNIBS or gmsh), convergence will be much faster.
 
+### Warp.fem Implementation
+
+- **`src/tmswarp/solver_warp.py`** — Warp.fem solver. Key design:
+  - `warp.fem.Tetmesh` requires float32 node positions; all FEM is float32
+  - Per-element sigma passed as `wp.array(dtype=wp.float32)`, accessed via `s.element_index`
+  - dA/dt as a P1 discrete vector field (`dtype=wp.vec3f`)
+  - Gauge (phi[0]=0) via `fem.project_linear_system` with a single-entry BSR projector
+  - Solve: `bsr_cg` from `warp.examples.fem.utils`
+  - Returns float64 numpy array for compatibility with existing post-processing
+  - **Integrands must be module-level** (warp uses `inspect.getsource` for JIT)
+  - `warp_available()` guards import so module loads without warp installed
+
+### Timing (Apple Silicon CPU, cached kernels)
+
+| Elements | NumPy FEM (s) | Warp.fem CPU (s) | Note |
+|----------|---------------|------------------|------|
+| 847      | 0.57          | 7.25             | First call: JIT compile |
+| 3,704    | 0.008         | 0.09             |      |
+| 8,202    | 0.023         | 0.23             |      |
+| 16,337   | 0.07          | 0.49             |      |
+| 29,000   | 0.22          | 0.76             | GPU expected to dominate |
+
+NumPy uses `scipy.sparse.linalg.spsolve` (direct). Warp uses CG, which converges
+slower but scales better to GPU and very large systems.
+
 ### Visualization
 
-- `convergence_visualization.png` — z=0 cross-sections showing analytical |E|, FEM |E|, and relative error at each mesh resolution
-- `convergence_plot.png` — RDM and |MAG| vs element count with threshold lines
-- `visualize_convergence.py` — script that generates both images
-
-## What's Next: Warp.fem GPU Implementation
+- `convergence_visualization.png` — z=0 cross-sections: Analytical, NumPy FEM, Warp.fem, Error
+- `convergence_plot.png` — RDM and |MAG| vs element count for both solvers
+- `timing_plot.png` — Wall-clock time vs element count for all methods
+- `visualize_convergence.py` — generates all three images
 
 ### The Physics (Quick Reference)
 
@@ -64,22 +88,17 @@ Total E-field: `E = -∇φ - ∂A/∂t`
 - BC: zero normal current on outer surface (natural Neumann, free in FEM)
 - Gauge: pin one node to φ=0 for uniqueness
 
-### Warp.fem Implementation Plan
+### Warp.fem Implementation Notes (DONE — see solver_warp.py)
 
-The `warp.fem` module has everything needed:
-
-1. **`fem.Tetmesh`** — accepts numpy arrays of nodes/elements directly
-2. **`fem.make_polynomial_space(geo, degree=1, element_basis=LAGRANGE)`** — P1 scalar space for φ
-3. **Integrands** via `@fem.integrand` decorator:
-   - Stiffness: `σ * wp.dot(fem.grad(u, s), fem.grad(v, s))`
-   - RHS: `σ * wp.dot(dAdt_field(s), fem.grad(v, s))`
-4. **Assembly**: `fem.integrate(integrand, fields={"u": trial, "v": test})`
-5. **BCs**: `fem.BoundarySides(geo)` + `fem.project_linear_system()`
-6. **Solve**: `bsr_cg()` from `warp.optim.linear` (CG for SPD system)
-
-Key reference: the `warp/examples/fem/example_magnetostatics.py` demonstrates the full pattern (curl-curl with Nedelec elements — our scalar Poisson is simpler). The `example_diffusion_3d.py` is the closest analogue.
-
-**Critical: Nedelec elements are NOT needed.** TMS uses scalar potential φ with standard Lagrange elements. The magnetostatics example uses Nedelec because it solves for the vector potential A directly — a different formulation.
+Key lessons learned during implementation:
+- `fem.Tetmesh` requires `wp.vec3f` (float32) positions — float64 fails at kernel launch
+- All FEM quantities must be float32 to match; mixed precision fails with "scalar type mismatch"
+- Per-element conductivity: use `wp.array(dtype=wp.float32)`, indexed via `s.element_index`
+- dA/dt: create a separate `make_polynomial_space(geo, dtype=wp.vec3f)` space, then `make_field()`
+- Gauge: `bsr_zeros(n,n,wp.float32)` + `bsr_set_from_triplets` + `fem.project_linear_system`
+- CG solver: `from warp.examples.fem.utils import bsr_cg`; not from `warp.optim.linear`
+- `@fem.integrand` decorators must be at module scope (not inside functions or `if` blocks)
+- `example_diffusion_3d.py` in warp examples is the closest analogue to our problem
 
 ### RPyC Service Interface
 
@@ -107,10 +126,12 @@ For context on the integration target:
 ## Development Environment
 
 - Use `pixi` for environment management (pixi.toml is in the repo)
-- `pixi add python=3.12 numpy scipy pytest matplotlib` for development
-- `pixi run pip install -e "." --no-deps` to install tmswarp in editable mode
-- `pixi run pytest -v` to run tests
-- GPU work requires a Linux machine with Nvidia GPU + CUDA for warp-lang
+- `pixi install` sets up the environment (includes warp-lang via [pypi-dependencies])
+- `pixi run pytest -v` to run tests (28 tests, all pass)
+- `pixi run python visualize_convergence.py` to regenerate comparison plots
+- pixi.toml has `osx-64`, `osx-arm64`, and `linux-64` platforms
+- warp-lang ships a universal2 macOS binary that works on both Intel and Apple Silicon
+- GPU work: test on Linux+CUDA; just change `device="cpu"` to `device="cuda:0"`
 
 ## Package Structure
 
@@ -123,18 +144,23 @@ TMSWarp/
 │   ├── analytical.py        # Heller & van Hulsteyn analytical solution
 │   ├── coil.py              # Biot-Savart dA/dt
 │   ├── conductor.py         # TetMesh dataclass + sphere mesh generator
-│   ├── solver.py            # FEM assembly + solve (numpy/scipy)
+│   ├── solver.py            # FEM assembly + solve (numpy/scipy, float64)
+│   ├── solver_warp.py       # FEM assembly + solve (warp.fem, float32, GPU-ready)
 │   ├── fields.py            # E-field post-processing + RDM/MAG metrics
 │   └── py.typed             # PEP 561 marker
 ├── tests/
 │   ├── test_install.py      # Import smoke tests
 │   ├── test_analytical.py   # Analytical solution properties
 │   ├── test_coil.py         # dA/dt correctness
-│   └── test_solver.py       # FEM vs analytical validation
+│   ├── test_solver.py       # NumPy FEM vs analytical validation
+│   └── test_solver_warp.py  # Warp.fem vs NumPy FEM + analytical (skipped if no warp)
 ├── .github/workflows/
 │   ├── test.yml             # CI: pytest on Python 3.9-3.13
 │   └── publish.yml          # PyPI trusted publishing on GitHub release
-└── visualize_convergence.py # Generates convergence comparison images
+├── visualize_convergence.py # Generates all comparison images (3 output PNGs)
+├── convergence_visualization.png  # z=0 slices: Ana / NumPy / Warp / Error
+├── convergence_plot.png           # RDM+MAG convergence curves
+└── timing_plot.png                # Wall-clock timing comparison
 ```
 
 ## Conventions
