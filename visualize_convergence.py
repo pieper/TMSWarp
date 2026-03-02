@@ -35,7 +35,7 @@ DIPOLE_MOMENT = np.array([1.0, 0.0, 0.0])  # unit vector
 DIDT = 1e6              # A/s
 CONDUCTIVITY = 1.0      # S/m
 
-OUTDIR = "/Users/pieper/slicer/latest/SlicerTMS/TMSWarp"
+OUTDIR = str(__import__("pathlib").Path(__file__).resolve().parent)
 
 
 # ---------------------------------------------------------------------------
