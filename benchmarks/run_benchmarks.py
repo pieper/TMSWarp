@@ -281,6 +281,11 @@ def run_benchmarks(device=None, repeats=3, notes=""):
     print(f"  Host:     {meta['hostname']}")
     print(f"  Platform: {meta['platform']}")
     print(f"  Warp:     {meta['warp_version']} on {meta['warp_device']}")
+    if meta.get('gpu_devices'):
+        for gpu in meta['gpu_devices']:
+            mem = f", {gpu['memory_gb']} GB" if 'memory_gb' in gpu else ""
+            print(f"  GPU:      {gpu['name']}{mem}")
+    print(f"  Device:   {device}")
     print(f"  Repeats:  {repeats} (minimum time recorded)\n")
 
     configs_out = []

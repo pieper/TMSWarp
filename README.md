@@ -79,6 +79,22 @@ git push
 
 Include a short machine description in the commit message (e.g. "M2 MacBook Pro, CPU-only" or "RTX 5060 Ti, CUDA 12.8").
 
+### GPU scaling benchmark
+
+The standard benchmark uses small meshes (up to 29k elements) optimized for accuracy validation, which is too small for GPU to show speedups. The GPU scaling benchmark goes up to 500k+ elements to find the CPU/GPU crossover point:
+
+```bash
+python benchmarks/gpu_scaling.py
+python benchmarks/gpu_scaling.py --max-elements 500000
+```
+
+This compares three solver configurations side-by-side at each mesh size:
+- **NumPy FEM** — scipy `spsolve` (direct solver, CPU-only)
+- **Warp.fem CPU** — CG iterative solver on CPU
+- **Warp.fem GPU** — CG iterative solver on CUDA GPU
+
+The output prints the GPU/CPU speedup for each mesh size, showing where GPU starts to dominate (typically around 100k+ elements). The script confirms which device is actually being used and saves results to `benchmarks/results/`.
+
 ### Comparing results across machines
 
 Once multiple result files are checked in, compare them:
