@@ -45,24 +45,26 @@ cd TMSWarp
 pixi run python benchmarks/run_benchmarks.py
 ```
 
-On a machine with an Nvidia GPU, pass `--device cuda:0`:
+The script auto-detects the best available device — it will use `cuda:0` on a machine with an Nvidia GPU, or `cpu` otherwise. You can override this:
 
 ```bash
-pixi run python benchmarks/run_benchmarks.py --device cuda:0
+pixi run python benchmarks/run_benchmarks.py --device cpu       # force CPU
+pixi run python benchmarks/run_benchmarks.py --device cuda:0    # force specific GPU
 ```
 
 Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--device` | `cpu` | Warp device (`cpu`, `cuda:0`, etc.) |
+| `--device` | auto-detect | Warp device (`cpu`, `cuda:0`, etc.). Uses GPU if available. |
 | `--repeats` | `3` | Timing repeats per mesh size (minimum is recorded) |
 | `--notes` | `""` | Free-text note stored in the result metadata |
 
-The script runs both the NumPy and Warp.fem solvers at five mesh resolutions, validates against the analytical solution, and saves a JSON file to `benchmarks/results/`. The filename encodes hostname, architecture, device, and timestamp, e.g.:
+The script runs both the NumPy and Warp.fem solvers at five mesh resolutions, validates against the analytical solution, and saves a JSON file to `benchmarks/results/`. The JSON includes full machine metadata (hostname, platform, Python/NumPy/SciPy/Warp versions, GPU device names and memory). The filename encodes hostname, architecture, device, and timestamp, e.g.:
 
 ```
 benchmarks/results/slate_arm64_cpu_20260302_164440.json
+benchmarks/results/workstation_x86_64_cuda0_20260302_201530.json
 ```
 
 ### Submitting results to the repo

@@ -5,9 +5,10 @@ sizes, saves results to a machine-stamped JSON file in benchmarks/results/.
 
 Usage
 -----
-    pixi run python benchmarks/run_benchmarks.py              # CPU (default)
-    pixi run python benchmarks/run_benchmarks.py --device cuda:0   # GPU
-    pixi run python benchmarks/run_benchmarks.py --repeats 5       # more timing repeats
+    pixi run python benchmarks/run_benchmarks.py              # auto-detect best device
+    pixi run python benchmarks/run_benchmarks.py --device cpu        # force CPU
+    pixi run python benchmarks/run_benchmarks.py --device cuda:0     # force specific GPU
+    pixi run python benchmarks/run_benchmarks.py --repeats 5         # more timing repeats
 
 The minimum wall-clock time across repeats is recorded (standard benchmark
 practice — eliminates OS scheduling jitter while preserving true floor).
@@ -23,6 +24,9 @@ Output JSON schema
     "scipy_version": str,
     "warp_version": str | null,
     "warp_device": str,     # e.g. "cpu (arm)" or "cuda:0 (NVIDIA A100)"
+    "gpu_devices": [        # present only when CUDA GPUs are detected
+      {"name": str, "device_id": str, "memory_gb": float, "arch": str}
+    ],
     "timestamp": str,       # ISO-8601
     "repeats": int,
     "notes": str
@@ -133,6 +137,10 @@ def time_warp(mesh, dAdt_nodes, device, repeats):
 
     _init_warp()
 
+    # Auto-detect preferred device if not specified
+    if device is None:
+        device = wp.get_preferred_device()
+
     def _build_and_solve(mesh, dAdt_nodes, device):
         positions = wp.array(mesh.nodes.astype(np.float32), dtype=wp.vec3f, device=device)
         tet_indices = wp.array(mesh.elements.astype(np.int32), dtype=int, device=device)
@@ -208,24 +216,36 @@ def time_warp(mesh, dAdt_nodes, device, repeats):
 # ---------------------------------------------------------------------------
 
 def collect_metadata(device, repeats, notes):
-    """Gather machine / environment info."""
+    """Gather machine / environment info, including GPU details when available."""
     warp_ver = None
     warp_device_str = "unavailable"
+    gpu_info = None
     if warp_available():
         import warp as wp
         warp_ver = wp.__version__
         try:
-            devs = wp.get_devices()
-            if device in devs:
-                d = wp.get_device(device)
-                warp_device_str = f"{device} ({d.name})"
-            else:
-                warp_device_str = f"{device} (not found — available: {devs})"
+            d = wp.get_device(device)
+            warp_device_str = f"{device} ({d.name})"
         except Exception:
-            warp_device_str = device
+            warp_device_str = str(device)
+
+        # Collect info for all CUDA devices
+        cuda_devices = []
+        try:
+            for dev in wp.get_cuda_devices():
+                info = {"name": dev.name, "device_id": str(dev)}
+                if hasattr(dev, "total_memory"):
+                    info["memory_gb"] = round(dev.total_memory / (1024**3), 1)
+                if hasattr(dev, "arch"):
+                    info["arch"] = str(dev.arch)
+                cuda_devices.append(info)
+        except Exception:
+            pass
+        if cuda_devices:
+            gpu_info = cuda_devices
 
     import scipy
-    return {
+    meta = {
         "hostname": socket.gethostname(),
         "platform": f"{platform.system()} {platform.machine()}",
         "python": platform.python_version(),
@@ -237,9 +257,25 @@ def collect_metadata(device, repeats, notes):
         "repeats": repeats,
         "notes": notes,
     }
+    if gpu_info:
+        meta["gpu_devices"] = gpu_info
+    return meta
 
 
-def run_benchmarks(device="cpu", repeats=3, notes=""):
+def _resolve_device(device):
+    """Resolve device, auto-detecting preferred device if None."""
+    if device is not None:
+        return device
+    if warp_available():
+        import warp as wp
+        from tmswarp.solver_warp import _init_warp
+        _init_warp()
+        return str(wp.get_preferred_device())
+    return "cpu"
+
+
+def run_benchmarks(device=None, repeats=3, notes=""):
+    device = _resolve_device(device)
     meta = collect_metadata(device, repeats, notes)
     print(f"\nTMSWarp Benchmark")
     print(f"  Host:     {meta['hostname']}")
@@ -332,8 +368,8 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--device", default="cpu",
-        help="Warp device (e.g. 'cpu', 'cuda:0')",
+        "--device", default=None,
+        help="Warp device (e.g. 'cpu', 'cuda:0'). Auto-detects best device if omitted.",
     )
     parser.add_argument(
         "--repeats", type=int, default=3,
