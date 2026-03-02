@@ -118,7 +118,7 @@ def solve_fem_warp(
     mesh,
     dAdt_nodes: np.ndarray,
     pin_node: int = 0,
-    device: str = "cpu",
+    device=None,
     quiet: bool = True,
 ) -> np.ndarray:
     """Warp.fem solver for the TMS Poisson equation.
@@ -134,8 +134,9 @@ def solve_fem_warp(
         Primary field dA/dt at mesh nodes (V/m).
     pin_node : int
         Node index to pin to phi = 0 (gauge condition).
-    device : str
+    device : str or None
         Warp device string, e.g. ``"cpu"`` or ``"cuda:0"``.
+        If None (default), uses warp's preferred device (GPU if available).
     quiet : bool
         Suppress CG iteration residual output.
 
@@ -160,6 +161,10 @@ def solve_fem_warp(
     import warp as wp
     import warp.fem as fem
     from warp.examples.fem.utils import bsr_cg
+
+    # Default to warp's preferred device (cuda:0 if GPU available, else cpu)
+    if device is None:
+        device = wp.get_preferred_device()
 
     # ------------------------------------------------------------------
     # Build warp.fem geometry  (Tetmesh requires float32 positions)
@@ -213,15 +218,19 @@ def solve_fem_warp(
     # ------------------------------------------------------------------
     # Gauge condition: pin phi[pin_node] = 0
     # ------------------------------------------------------------------
+    # fem.integrate may place output on the geometry's device, which can
+    # differ from the requested device (e.g. cuda:0 when GPU is present).
+    # Detect the actual device from the assembled RHS to stay consistent.
+    actual_device = b.device
     n_nodes = len(mesh.nodes)
-    projector = _make_gauge_projector(n_nodes, pin_node, device=device)
-    fixed_val = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    projector = _make_gauge_projector(n_nodes, pin_node, device=actual_device)
+    fixed_val = wp.zeros(n_nodes, dtype=wp.float32, device=actual_device)
     fem.project_linear_system(K, b, projector, fixed_val)
 
     # ------------------------------------------------------------------
     # Conjugate Gradient solve
     # ------------------------------------------------------------------
-    x = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    x = wp.zeros(n_nodes, dtype=wp.float32, device=actual_device)
     bsr_cg(K, b=b, x=x, quiet=quiet)
 
     # Return as float64 for compatibility with the rest of the pipeline
