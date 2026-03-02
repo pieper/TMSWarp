@@ -165,15 +165,18 @@ def time_warp(mesh, dAdt_nodes, device, repeats):
             values={"sigma": sigma_wp},
             output_dtype=wp.float32,
         )
+        # Detect actual device from fem.integrate output (may differ from
+        # requested device when GPU is present)
+        actual_device = b.device
         n_nodes = len(mesh.nodes)
-        projector = _make_gauge_projector(n_nodes, 0, device=device)
-        fixed_val = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+        projector = _make_gauge_projector(n_nodes, 0, device=actual_device)
+        fixed_val = wp.zeros(n_nodes, dtype=wp.float32, device=actual_device)
         fem.project_linear_system(K, b, projector, fixed_val)
         wp.synchronize()
         t_assemble = time.perf_counter() - t0
 
         # -- solve --
-        x = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+        x = wp.zeros(n_nodes, dtype=wp.float32, device=actual_device)
         t0 = time.perf_counter()
         bsr_cg(K, b=b, x=x, quiet=True)
         wp.synchronize()
