@@ -1,13 +1,14 @@
 """Compare TMSWarp benchmark results across machines and devices.
 
-Loads all JSON files from benchmarks/results/ and prints a comparison table.
-Optionally generates a comparison plot.
+Loads all JSON files from benchmarks/results/ and prints a leaderboard
+sorted by best speedup, plus optional detailed comparison tables and plots.
 
 Usage
 -----
-    pixi run python benchmarks/compare_results.py
-    pixi run python benchmarks/compare_results.py --plot
-    pixi run python benchmarks/compare_results.py --metric warp_total
+    python benchmarks/compare_results.py                       # leaderboard (default)
+    python benchmarks/compare_results.py --detail              # full comparison table
+    python benchmarks/compare_results.py --metric warp_total   # specific metric table
+    python benchmarks/compare_results.py --plot                # comparison plot
 """
 
 import argparse
@@ -32,12 +33,154 @@ def load_results():
     return runs
 
 
+def _get_configs(run):
+    """Get the config list from either run_benchmarks or gpu_scaling format."""
+    return run.get("configs") or run.get("results") or []
+
+
+def _run_description(run):
+    """One-line description of a benchmark run."""
+    m = run["metadata"]
+    host = m["hostname"].split(".")[0]
+    plat = m["platform"]
+    device = m.get("warp_device", "")
+    gpus = m.get("gpu_devices", [])
+    gpu_str = gpus[0]["name"] if gpus else ""
+    return host, plat, device, gpu_str
+
+
+def _compute_speedups(run):
+    """Compute speedup ratios for each config in a run.
+
+    Returns list of dicts with keys: n_elements, numpy_vs_warp, cpu_vs_gpu.
+    Handles both run_benchmarks format (configs) and gpu_scaling format (results).
+    """
+    configs = _get_configs(run)
+    rows = []
+    for c in configs:
+        ne = c.get("n_elements", 0)
+        row = {"n_elements": ne}
+
+        # run_benchmarks format: NumPy vs Warp (single device)
+        np_t = c.get("t_numpy_total_s") or c.get("t_numpy_tot")
+        wp_t = c.get("t_warp_total_s") or c.get("t_warp_cpu_tot")
+        if np_t and wp_t and wp_t > 0:
+            row["numpy_vs_warp"] = np_t / wp_t
+
+        # gpu_scaling format: Warp CPU vs Warp GPU
+        cpu_t = c.get("t_warp_cpu_tot")
+        gpu_t = c.get("t_warp_gpu_tot")
+        if cpu_t and gpu_t and gpu_t > 0:
+            row["cpu_vs_gpu"] = cpu_t / gpu_t
+
+        # NumPy vs Warp GPU (overall best speedup)
+        if np_t and gpu_t and gpu_t > 0:
+            row["numpy_vs_gpu"] = np_t / gpu_t
+
+        # Best solver time at this mesh size
+        times = [t for t in [np_t, wp_t, gpu_t] if t is not None and t > 0]
+        if times:
+            row["best_time"] = min(times)
+
+        rows.append(row)
+    return rows
+
+
+def print_leaderboard(runs):
+    """Print a leaderboard: one row per result file, sorted by best speedup."""
+    if not runs:
+        print("No benchmark results found in", RESULTS_DIR)
+        return
+
+    entries = []
+    for run in runs:
+        host, plat, device, gpu_str = _run_description(run)
+        configs = _get_configs(run)
+        speedups = _compute_speedups(run)
+
+        if not speedups:
+            continue
+
+        # Largest mesh
+        largest = max(speedups, key=lambda r: r["n_elements"])
+        n_elem = largest["n_elements"]
+
+        # Best time at largest mesh
+        best_time = largest.get("best_time")
+
+        # Pick the most relevant speedup
+        # Prefer GPU speedup if available, else NumPy vs Warp
+        gpu_speedup = largest.get("cpu_vs_gpu")
+        np_speedup = largest.get("numpy_vs_warp")
+
+        # For sorting: use GPU speedup if available, else numpy/warp ratio
+        sort_key = gpu_speedup or np_speedup or 0.0
+
+        entries.append({
+            "host": host,
+            "platform": plat,
+            "device": device,
+            "gpu": gpu_str,
+            "n_elements": n_elem,
+            "best_time": best_time,
+            "gpu_speedup": gpu_speedup,
+            "np_speedup": np_speedup,
+            "sort_key": sort_key,
+            "filename": run["_filename"],
+        })
+
+    # Sort by speedup (highest first)
+    entries.sort(key=lambda e: e["sort_key"], reverse=True)
+
+    # Print
+    print(f"\n{'='*80}")
+    print("TMSWarp Benchmark Leaderboard")
+    print(f"{'='*80}")
+    print(f"{'#':>3}  {'Host':<16} {'Platform':<16} {'Device/GPU':<28} "
+          f"{'Elements':>10} {'Best(s)':>8} {'Speedup':>8}")
+    print("-" * 96)
+
+    for i, e in enumerate(entries, 1):
+        device_col = e["gpu"] if e["gpu"] else e["device"]
+        if len(device_col) > 27:
+            device_col = device_col[:24] + "..."
+
+        best = f"{e['best_time']:.3f}" if e["best_time"] is not None else "N/A"
+
+        if e["gpu_speedup"] is not None:
+            speedup_str = f"{e['gpu_speedup']:.2f}x GPU"
+        elif e["np_speedup"] is not None:
+            ratio = e["np_speedup"]  # numpy_time / warp_time
+            if ratio > 1:
+                # NumPy takes longer → Warp is faster
+                speedup_str = f"{ratio:.2f}x Warp"
+            else:
+                # NumPy takes less time → NumPy is faster
+                speedup_str = f"{1/ratio:.2f}x NP"
+        else:
+            speedup_str = "N/A"
+
+        print(f"{i:>3}  {e['host']:<16} {e['platform']:<16} {device_col:<28} "
+              f"{e['n_elements']:>10,} {best:>8} {speedup_str:>8}")
+
+    print()
+    print("Speedup column:")
+    print("  'X.XXx GPU'  = Warp GPU is Xx faster than Warp CPU (gpu_scaling results)")
+    print("  'X.XXx Warp' = Warp is Xx faster than NumPy")
+    print("  'X.XXx NP'   = NumPy is Xx faster than Warp (small meshes, expected)")
+    print(f"\nFiles: {RESULTS_DIR}")
+
+
+# ---------------------------------------------------------------------------
+# Detailed comparison (original functionality)
+# ---------------------------------------------------------------------------
+
 def run_label(run):
     """Short human-readable label for a benchmark run."""
     m = run["metadata"]
     host = m["hostname"].split(".")[0]
     plat = m["platform"]
-    dev = m["warp_device"].split("(")[0].strip()
+    dev = m.get("warp_device", "?").split("(")[0].strip()
     ts = m["timestamp"][:10]
     return f"{host} | {plat} | warp:{dev} | {ts}"
 
@@ -48,11 +191,15 @@ def print_comparison(runs, metric="numpy_total"):
         print("No benchmark results found in", RESULTS_DIR)
         return
 
-    # Collect element counts (from first run as reference)
-    ref_elems = [c["n_elements"] for c in runs[0]["configs"]]
+    # Only use runs that have 'configs' (run_benchmarks format)
+    compat_runs = [r for r in runs if "configs" in r]
+    if not compat_runs:
+        print("No standard benchmark results found (only gpu_scaling results).")
+        return
 
-    # Header
-    labels = [run_label(r) for r in runs]
+    ref_elems = [c["n_elements"] for c in compat_runs[0]["configs"]]
+
+    labels = [run_label(r) for r in compat_runs]
     col_w = max(14, max(len(l) for l in labels))
     elem_w = 8
 
@@ -70,12 +217,11 @@ def print_comparison(runs, metric="numpy_total"):
     key, title = metric_map.get(metric, ("t_numpy_total_s", metric))
 
     print(f"\n{'':>{elem_w}}  " + "  ".join(f"{l:>{col_w}}" for l in labels))
-    print(f"{'Elements':>{elem_w}}  " + "  ".join("-" * col_w for _ in runs))
+    print(f"{'Elements':>{elem_w}}  " + "  ".join("-" * col_w for _ in compat_runs))
 
-    for ref_ne, elem_count in enumerate(ref_elems):
+    for elem_count in ref_elems:
         row = f"{elem_count:>{elem_w}}"
-        for run in runs:
-            # Find matching config by element count (closest)
+        for run in compat_runs:
             configs = run["configs"]
             match = min(configs, key=lambda c: abs(c["n_elements"] - elem_count))
             val = match.get(key)
@@ -87,22 +233,7 @@ def print_comparison(runs, metric="numpy_total"):
         print(row)
 
     print(f"\nMetric: {title}")
-    print(f"Files:  {', '.join(r['_filename'] for r in runs)}")
-
-
-def print_summary_table(runs):
-    """Print metadata summary for all runs."""
-    print(f"\n{'File':<50}  {'Host':<20}  {'Platform':<15}  {'Warp device':<25}  {'Date':<12}")
-    print("-" * 130)
-    for r in runs:
-        m = r["metadata"]
-        print(
-            f"{r['_filename']:<50}  "
-            f"{m['hostname'].split('.')[0]:<20}  "
-            f"{m['platform']:<15}  "
-            f"{m['warp_device']:<25}  "
-            f"{m['timestamp'][:10]:<12}"
-        )
+    print(f"Files:  {', '.join(r['_filename'] for r in compat_runs)}")
 
 
 def plot_comparison(runs, metric="numpy_total", output=None):
@@ -125,9 +256,9 @@ def plot_comparison(runs, metric="numpy_total", output=None):
     colors = plt.cm.tab10.colors
 
     for i, run in enumerate(runs):
-        elems = [c["n_elements"] for c in run["configs"]]
-        vals = [c.get(key) for c in run["configs"]]
-        # Drop None
+        configs = _get_configs(run)
+        elems = [c["n_elements"] for c in configs]
+        vals = [c.get(key) for c in configs]
         valid = [(e, v) for e, v in zip(elems, vals) if v is not None]
         if not valid:
             continue
@@ -155,6 +286,10 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--detail", action="store_true",
+        help="Show detailed per-element comparison table instead of leaderboard",
+    )
+    parser.add_argument(
         "--metric",
         default="numpy_total",
         choices=[
@@ -162,7 +297,7 @@ if __name__ == "__main__":
             "warp_total", "warp_assembly", "warp_solve",
             "rdm_numpy", "rdm_warp",
         ],
-        help="Which metric to display/plot",
+        help="Which metric to display in --detail mode",
     )
     parser.add_argument(
         "--plot", action="store_true",
@@ -175,8 +310,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     runs = load_results()
-    print_summary_table(runs)
-    print_comparison(runs, metric=args.metric)
+
+    if args.detail:
+        print_comparison(runs, metric=args.metric)
+    else:
+        print_leaderboard(runs)
 
     if args.plot or args.save_plot:
         plot_comparison(runs, metric=args.metric, output=args.save_plot)
