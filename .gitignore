@@ -16,3 +16,7 @@ venv/
 # pixi environments
 .pixi
 *.egg-info
+
+# Large mesh data files fetched locally (not redistributed; run scripts/fetch_ernie.py)
+ernie_data.npz
+ernie_dataset/

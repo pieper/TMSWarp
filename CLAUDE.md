@@ -43,6 +43,28 @@ Results on the SimNIBS mesh (same dipole config as SimNIBS's own test_fem.py):
 
 The Warp.fem result nearly meets SimNIBS's strict RDM < 0.2 threshold despite float32 geometry.
 
+### Ernie Human Head Mesh Validation
+
+The `ernie_data.npz` file (1.3M tets, 222k nodes, 6 tissues) is fetched from the SimNIBS
+example dataset (not committed to git — it's 19 MB and separately licensed):
+
+    /path/to/SimNIBS-4.5/simnibs_env/bin/python scripts/fetch_ernie.py [/optional/path/to/zip]
+
+The script downloads from `https://github.com/simnibs/example-dataset/releases/download/v4.0-lowres/ernie_lowres_V2.zip`.
+
+Results on the ernie mesh (dipole at z=200mm, 6 tissues, Apple Silicon CPU):
+
+| Solver    | Time   | vs NumPy | E-field (mean/max V/m) | Note |
+|-----------|--------|----------|----------------------|------|
+| NumPy FEM | 246 s  | —        | 0.484 / 41.2         | float64, direct solve |
+| Warp.fem  | 111 s  | 2.21×    | 0.569 / 49.4         | float32, CG |
+
+**Known limitation**: Warp.fem uses float32 geometry and arithmetic throughout. For the ernie
+mesh with 165:1 conductivity contrast (skull σ=0.01 vs CSF σ=1.654), float32 precision
+degrades the accuracy significantly (RDM = 0.53 between solvers). This is expected — the
+sphere3 validation with uniform conductivity gives RDM = 0.06. GPU acceleration will be
+most impactful once a float64 or mixed-precision GPU path is implemented.
+
 ### Convergence (Delaunay meshes, P1 elements)
 
 | Elements | RDM   | MAG   |
@@ -169,9 +191,11 @@ TMSWarp/
 │   ├── test_solver_warp.py       # Warp.fem vs NumPy FEM + analytical (skipped if no warp)
 │   └── test_sphere3_validation.py  # Both solvers vs SimNIBS sphere3 mesh (skipped if no data)
 ├── scripts/
-│   └── extract_sphere3.py    # Run with SimNIBS Python to create sphere3_data.npz
+│   ├── extract_sphere3.py    # Run with SimNIBS Python to create sphere3_data.npz
+│   └── fetch_ernie.py        # Download + extract ernie head mesh to ernie_data.npz
 ├── benchmarks/
-│   └── sphere3_validation.py # Standalone validation + timing against sphere3 mesh
+│   ├── sphere3_validation.py # Validation against SimNIBS sphere3 mesh
+│   └── ernie_validation.py   # Timing + comparison on realistic human head mesh
 ├── .github/workflows/
 │   ├── test.yml             # CI: pytest on Python 3.9-3.13
 │   └── publish.yml          # PyPI trusted publishing on GitHub release
