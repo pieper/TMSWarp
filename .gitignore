@@ -20,3 +20,5 @@ venv/
 # Large mesh data files fetched locally (not redistributed; run scripts/fetch_ernie.py)
 ernie_data.npz
 ernie_dataset/
+ernie_simnibs_efield.npz
+ernie_tmswarp_efield.npz

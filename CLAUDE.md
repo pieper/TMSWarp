@@ -52,6 +52,11 @@ example dataset (not committed to git — it's 19 MB and separately licensed):
 
 The script downloads from `https://github.com/simnibs/example-dataset/releases/download/v4.0-lowres/ernie_lowres_V2.zip`.
 
+**Comparison figure**: `ernie_comparison.png` — axial/coronal/sagittal slices of |E|, with
+TMSWarp vs SimNIBS side-by-side and absolute + relative difference maps.
+Generate via: `scripts/run_simnibs_efield.py` (SimNIBS Python) then `benchmarks/ernie_comparison.py` (pixi).
+TMSWarp NumPy FEM and SimNIBS FEM are numerically identical (RDM=0.000, |MAG|=0.000).
+
 Results on the ernie mesh (dipole at z=200mm, 6 tissues, Apple Silicon CPU):
 
 | Solver    | Time   | vs NumPy | E-field (mean/max V/m) | Note |
@@ -191,11 +196,13 @@ TMSWarp/
 │   ├── test_solver_warp.py       # Warp.fem vs NumPy FEM + analytical (skipped if no warp)
 │   └── test_sphere3_validation.py  # Both solvers vs SimNIBS sphere3 mesh (skipped if no data)
 ├── scripts/
-│   ├── extract_sphere3.py    # Run with SimNIBS Python to create sphere3_data.npz
-│   └── fetch_ernie.py        # Download + extract ernie head mesh to ernie_data.npz
+│   ├── extract_sphere3.py       # Run with SimNIBS Python to create sphere3_data.npz
+│   ├── fetch_ernie.py           # Download + extract ernie head mesh to ernie_data.npz
+│   └── run_simnibs_efield.py    # Run SimNIBS FEM on ernie → ernie_simnibs_efield.npz
 ├── benchmarks/
-│   ├── sphere3_validation.py # Validation against SimNIBS sphere3 mesh
-│   └── ernie_validation.py   # Timing + comparison on realistic human head mesh
+│   ├── sphere3_validation.py    # Validation against SimNIBS sphere3 mesh
+│   ├── ernie_validation.py      # Timing + comparison on realistic human head mesh
+│   └── ernie_comparison.py      # Load both results; generate ernie_comparison.png
 ├── .github/workflows/
 │   ├── test.yml             # CI: pytest on Python 3.9-3.13
 │   └── publish.yml          # PyPI trusted publishing on GitHub release
