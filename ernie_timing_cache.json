@@ -1,0 +1,17 @@
+{
+  "SimNIBS\nTMSFEM": {
+    "assembly": 1.51,
+    "solve": 244.01,
+    "total": 245.52
+  },
+  "TMSWarp\nNumPy FEM": {
+    "assembly": 1.5336638749577105,
+    "solve": 243.7291941656731,
+    "total": 245.26285804063082
+  },
+  "TMSWarp\nWarp.fem": {
+    "assembly": null,
+    "solve": null,
+    "total": 111.02416749997064
+  }
+}
