@@ -22,13 +22,26 @@ A complete, working FEM solver using only numpy + scipy:
 
 - **`src/tmswarp/fields.py`** — Post-processing: `compute_efield_at_elements()` (E = -grad(phi) - dA/dt), plus `rdm()` and `mag()` validation metrics.
 
-### Test Results: 28 passed
+### Test Results: 32 passed
 
 All tests pass. Both FEM solvers validate against the analytical solution:
 - **NumPy FEM**: RDM = 0.192 (threshold < 0.2), MAG = 0.019 (threshold < log(1.1))
 - **Warp.fem**: RDM = 0.230 (threshold < 0.3 due to float32 geometry), MAG = 0.027
 
 These thresholds match SimNIBS's own validation criteria.
+
+### SimNIBS sphere3 Validation
+
+The `sphere3_data.npz` file (22 704 tets, 4 556 nodes) is extracted from SimNIBS's
+`sphere3.msh` reference mesh by running:
+
+    /path/to/SimNIBS-4.5/simnibs_env/bin/python scripts/extract_sphere3.py
+
+Results on the SimNIBS mesh (same dipole config as SimNIBS's own test_fem.py):
+- **NumPy FEM**: RDM = 0.169, MAG = 0.015 — **passes SimNIBS < 0.2 / < log(1.1)**
+- **Warp.fem**: RDM = 0.198, MAG = 0.020 — passes relaxed thresholds
+
+The Warp.fem result nearly meets SimNIBS's strict RDM < 0.2 threshold despite float32 geometry.
 
 ### Convergence (Delaunay meshes, P1 elements)
 
@@ -149,11 +162,16 @@ TMSWarp/
 │   ├── fields.py            # E-field post-processing + RDM/MAG metrics
 │   └── py.typed             # PEP 561 marker
 ├── tests/
-│   ├── test_install.py      # Import smoke tests
-│   ├── test_analytical.py   # Analytical solution properties
-│   ├── test_coil.py         # dA/dt correctness
-│   ├── test_solver.py       # NumPy FEM vs analytical validation
-│   └── test_solver_warp.py  # Warp.fem vs NumPy FEM + analytical (skipped if no warp)
+│   ├── test_install.py           # Import smoke tests
+│   ├── test_analytical.py        # Analytical solution properties
+│   ├── test_coil.py              # dA/dt correctness
+│   ├── test_solver.py            # NumPy FEM vs analytical validation
+│   ├── test_solver_warp.py       # Warp.fem vs NumPy FEM + analytical (skipped if no warp)
+│   └── test_sphere3_validation.py  # Both solvers vs SimNIBS sphere3 mesh (skipped if no data)
+├── scripts/
+│   └── extract_sphere3.py    # Run with SimNIBS Python to create sphere3_data.npz
+├── benchmarks/
+│   └── sphere3_validation.py # Standalone validation + timing against sphere3 mesh
 ├── .github/workflows/
 │   ├── test.yml             # CI: pytest on Python 3.9-3.13
 │   └── publish.yml          # PyPI trusted publishing on GitHub release
