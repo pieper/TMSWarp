@@ -47,7 +47,7 @@ DIDT          = 1e6
 # ---------------------------------------------------------------------------
 
 def time_tmswarp_numpy():
-    """Run TMSWarp NumPy FEM and return timing breakdown dict."""
+    """Run TMSWarp NumPy FEM and return (timing_dict, phi, mesh, dAdt, G)."""
     from tmswarp.coil import magnetic_dipole_dadt
     from tmswarp.conductor import TetMesh
     from tmswarp.solver import assemble_rhs_tms, assemble_stiffness, gradient_operator, solve_fem
@@ -61,49 +61,68 @@ def time_tmswarp_numpy():
     dAdt = magnetic_dipole_dadt(DIPOLE_POS_M, DIPOLE_MOMENT, DIDT, mesh.nodes)
 
     t0 = time.perf_counter()
-    G  = gradient_operator(mesh)
-    t1 = time.perf_counter()
-    K  = assemble_stiffness(mesh, G)
-    t2 = time.perf_counter()
-    b  = assemble_rhs_tms(mesh, dAdt, G)
-    t3 = time.perf_counter()
-    _  = solve_fem(K, b, pin_node=0)
-    t4 = time.perf_counter()
+    G   = gradient_operator(mesh)
+    t1  = time.perf_counter()
+    K   = assemble_stiffness(mesh, G)
+    t2  = time.perf_counter()
+    b   = assemble_rhs_tms(mesh, dAdt, G)
+    t3  = time.perf_counter()
+    phi = solve_fem(K, b, pin_node=0)
+    t4  = time.perf_counter()
 
-    return {
+    timing = {
         "assembly": t3 - t0,
         "solve":    t4 - t3,
         "total":    t4 - t0,
     }
+    return timing, phi, mesh, dAdt, G
 
 
-def time_tmswarp_warp():
-    """Run TMSWarp Warp.fem and return timing dict."""
+def time_tmswarp_warp(mesh=None, dAdt=None, device=None):
+    """Run TMSWarp Warp.fem and return (timing_dict, phi).
+
+    Parameters
+    ----------
+    mesh, dAdt : optional
+        Reuse mesh/dAdt from a prior NumPy run to avoid a second file load.
+    device : str or None
+        Warp device string (e.g. ``"cpu"`` or ``"cuda:0"``).
+        None means warp's preferred device (GPU if available, else CPU).
+
+    Notes
+    -----
+    Runs with quiet=False so CG iteration count is visible in output,
+    confirming the solver is genuinely working.  solve_fem_warp performs
+    an explicit wp.synchronize_device() before returning, so the timer
+    captures the true wall-clock time including GPU completion.
+    """
     from tmswarp.coil import magnetic_dipole_dadt
     from tmswarp.conductor import TetMesh, make_sphere_mesh
-    from tmswarp.solver import gradient_operator
     from tmswarp.solver_warp import solve_fem_warp, warp_available
 
     if not warp_available():
-        return None
+        return None, None
 
-    data = np.load(ERNIE_MESH_PATH)
-    mesh = TetMesh(
-        nodes=data["nodes"].astype(np.float64),
-        elements=data["elements"].astype(np.int32),
-        conductivity=data["conductivity"].astype(np.float64),
-    )
-    dAdt = magnetic_dipole_dadt(DIPOLE_POS_M, DIPOLE_MOMENT, DIDT, mesh.nodes)
+    if mesh is None or dAdt is None:
+        data = np.load(ERNIE_MESH_PATH)
+        mesh = TetMesh(
+            nodes=data["nodes"].astype(np.float64),
+            elements=data["elements"].astype(np.int32),
+            conductivity=data["conductivity"].astype(np.float64),
+        )
+        dAdt = magnetic_dipole_dadt(DIPOLE_POS_M, DIPOLE_MOMENT, DIDT, mesh.nodes)
 
-    # Warm up JIT on a small mesh
+    # Warm up JIT on a small mesh so JIT compilation is excluded from timing
     small = make_sphere_mesh(radius=0.05, n_shells=3, n_surface=50, conductivity=1.0)
     dAdt_s = magnetic_dipole_dadt(DIPOLE_POS_M, DIPOLE_MOMENT, DIDT, small.nodes)
-    _ = solve_fem_warp(small, dAdt_s, quiet=True)
+    _ = solve_fem_warp(small, dAdt_s, device=device, quiet=True)
 
-    t0 = time.perf_counter()
-    _ = solve_fem_warp(mesh, dAdt, quiet=True)
-    t1 = time.perf_counter()
-    return {"assembly": None, "solve": None, "total": t1 - t0}
+    t0  = time.perf_counter()
+    phi = solve_fem_warp(mesh, dAdt, device=device, quiet=False)
+    t1  = time.perf_counter()
+
+    timing = {"assembly": None, "solve": None, "total": t1 - t0}
+    return timing, phi
 
 
 def time_simnibs():
@@ -147,11 +166,17 @@ def time_simnibs():
 def make_timing_plot(results: dict):
     """Create a bar chart comparing solver timings."""
     solvers = list(results.keys())
-    colors_asm  = ["#4878cf", "#6acc65", "#d65f5f"]
-    colors_slv  = ["#2c5282", "#3d7a3f", "#922b21"]
-    colors_tot  = ["#1a3a5c", "#234d27", "#5c1a1a"]
+    n = len(solvers)
+    # Enough palette entries for up to 6 bars: blue, green, red, purple, orange, teal
+    _asm_palette = ["#4878cf", "#6acc65", "#d65f5f", "#9b59b6", "#e67e22", "#1abc9c"]
+    _slv_palette = ["#2c5282", "#3d7a3f", "#922b21", "#6c3483", "#9a5c0a", "#0e6655"]
+    _tot_palette = ["#1a3a5c", "#234d27", "#5c1a1a", "#4a235a", "#6e4606", "#0a4136"]
+    colors_asm = [_asm_palette[i % len(_asm_palette)] for i in range(n)]
+    colors_slv = [_slv_palette[i % len(_slv_palette)] for i in range(n)]
+    colors_tot = [_tot_palette[i % len(_tot_palette)] for i in range(n)]
 
-    fig, (ax_main, ax_zoom) = plt.subplots(1, 2, figsize=(13, 6))
+    fig_w = max(13, 4 * n)  # widen automatically for more bars
+    fig, (ax_main, ax_zoom) = plt.subplots(1, 2, figsize=(fig_w, 6))
 
     def _bar(ax, ylim=None):
         x = np.arange(len(solvers))
@@ -273,19 +298,59 @@ if __name__ == "__main__":
             sys.exit(1)
 
         print("Timing TMSWarp NumPy FEM ...")
-        np_r = time_tmswarp_numpy()
+        np_r, phi_np, _mesh, _dAdt, _G = time_tmswarp_numpy()
         results["TMSWarp\nNumPy FEM"] = np_r
         print(f"  assembly: {np_r['assembly']:.2f}s  "
               f"solve: {np_r['solve']:.2f}s  "
               f"total: {np_r['total']:.2f}s")
+        phi_np_stats = (float(np.min(phi_np)), float(np.max(phi_np)),
+                        float(np.std(phi_np)))
+        print(f"  phi: min={phi_np_stats[0]:.4f}  max={phi_np_stats[1]:.4f}"
+              f"  std={phi_np_stats[2]:.4f} V  (sanity: must be non-trivial)")
+        if phi_np_stats[2] < 1e-10:
+            print("  WARNING: NumPy phi is essentially zero — something is wrong.")
 
-        print("Timing TMSWarp Warp.fem ...")
-        wp = time_tmswarp_warp()
-        if wp:
-            results["TMSWarp\nWarp.fem"] = wp
-            print(f"  total: {wp['total']:.2f}s")
+        from tmswarp.fields import compute_efield_at_elements, rdm, mag
+        from tmswarp.solver_warp import warp_available
+
+        # E-field from NumPy reference — computed once, reused for all Warp runs
+        E_np_ref = compute_efield_at_elements(_mesh, phi_np, _dAdt, _G)
+
+        def _run_warp(label, device):
+            """Time Warp.fem on one device, validate result, add to results."""
+            print(f"Timing TMSWarp Warp.fem ({label}) ...")
+            wp_r, phi_wp = time_tmswarp_warp(mesh=_mesh, dAdt=_dAdt, device=device)
+            if wp_r is None:
+                print("  warp-lang not available, skipping.")
+                return
+            results[f"TMSWarp\nWarp.fem\n{label}"] = wp_r
+            print(f"  total: {wp_r['total']:.2f}s")
+
+            phi_std = float(np.std(phi_wp))
+            print(f"  phi std={phi_std:.4f} V  (must be non-trivial)")
+            if phi_std < 1e-10:
+                print("  ERROR: Warp phi is essentially zero — CG may not have run.")
+                return
+
+            E_wp = compute_efield_at_elements(_mesh, phi_wp, _dAdt, _G)
+            rdm_val = rdm(E_wp, E_np_ref)
+            mag_val = mag(E_wp, E_np_ref)
+            print(f"  Agreement with NumPy FEM:  RDM={rdm_val:.4f}  |MAG|={mag_val:.4f}")
+            print(f"  (expected on ernie float32: RDM~0.5 due to 165:1 conductivity contrast)")
+            if rdm_val > 1.0:
+                print("  WARNING: RDM > 1.0 — result is likely wrong (check CG convergence).")
+
+        if warp_available():
+            import warp as _wp
+            _wp.init()
+            # Always run on CPU explicitly, regardless of GPU availability
+            _run_warp("CPU", device="cpu")
+            # Run on GPU if present
+            gpu_devices = [d for d in _wp.get_devices() if d.is_cuda]
+            for gdev in gpu_devices:
+                _run_warp(f"GPU:{gdev.ordinal}", device=str(gdev))
         else:
-            print("  warp-lang not available, skipping.")
+            print("Timing TMSWarp Warp.fem ... warp-lang not available, skipping.")
 
         with open(TIMING_CACHE, "w") as f:
             json.dump(results, f, indent=2)

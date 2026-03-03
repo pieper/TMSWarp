@@ -120,6 +120,8 @@ def solve_fem_warp(
     pin_node: int = 0,
     device=None,
     quiet: bool = True,
+    tol: float = 1e-4,
+    max_iters: int = 0,
 ) -> np.ndarray:
     """Warp.fem solver for the TMS Poisson equation.
 
@@ -139,6 +141,10 @@ def solve_fem_warp(
         If None (default), uses warp's preferred device (GPU if available).
     quiet : bool
         Suppress CG iteration residual output.
+    tol : float
+        Relative residual tolerance for CG convergence (default 1e-4).
+    max_iters : int
+        Maximum CG iterations; 0 means up to the system size.
 
     Returns
     -------
@@ -149,6 +155,8 @@ def solve_fem_warp(
     ------
     ImportError
         If warp-lang is not installed.
+    RuntimeError
+        If CG fails to converge within ``max_iters`` iterations.
     """
     if not _WARP_INTEGRANDS_DEFINED:
         raise ImportError(
@@ -231,7 +239,23 @@ def solve_fem_warp(
     # Conjugate Gradient solve
     # ------------------------------------------------------------------
     x = wp.zeros(n_nodes, dtype=wp.float32, device=actual_device)
-    bsr_cg(K, b=b, x=x, quiet=quiet)
+    err, iters = bsr_cg(K, b=b, x=x, tol=tol, max_iters=max_iters, quiet=quiet)
+
+    # Explicit synchronization before reading back results.
+    # On CUDA, bsr_cg submits work via CUDA graphs which may be asynchronous.
+    # This guarantees the GPU has finished before the timer stops or data is read.
+    wp.synchronize_device(actual_device)
+
+    if not quiet:
+        print(f"  bsr_cg: {iters} iterations, final residual {err:.3e} (tol={tol:.1e})")
+
+    if err > tol:
+        raise RuntimeError(
+            f"bsr_cg did not converge: residual={err:.3e} > tol={tol:.1e} "
+            f"after {iters} iterations. "
+            "The solution is likely inaccurate. "
+            "Try increasing max_iters or loosening tol."
+        )
 
     # Return as float64 for compatibility with the rest of the pipeline
     return x.numpy().astype(np.float64)
