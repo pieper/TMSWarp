@@ -24,18 +24,29 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.cm as cm
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import Normalize, TwoSlopeNorm
+from scipy.interpolate import griddata
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
-ERNIE_MESH_PATH = ROOT / "ernie_data.npz"
-SIMNIBS_PATH    = ROOT / "ernie_simnibs_efield.npz"
-TIMING_CACHE    = ROOT / "ernie_timing_cache.json"
-OUTPATH         = ROOT / "ernie_timing.png"
+ERNIE_MESH_PATH   = ROOT / "ernie_data.npz"
+SIMNIBS_PATH      = ROOT / "ernie_simnibs_efield.npz"
+TIMING_CACHE      = ROOT / "ernie_timing_cache.json"
+OUTPATH           = ROOT / "ernie_timing.png"
+COMPARISON_OUTPATH = ROOT / "ernie_solver_comparison.png"
+
+# Slice planes (mm) — same as ernie_comparison.py
+AXIAL_Z    =  40.0
+CORONAL_Y  =  50.0
+SAGITTAL_X =   0.0
+SLAB_HALF  =   4.0
+GRID_N     = 200
 
 DIPOLE_POS_M  = np.array([0.0, 0.0, 0.200])
 DIPOLE_MOMENT = np.array([1.0, 0.0, 0.0])
@@ -157,6 +168,161 @@ def time_simnibs():
     _ = spalg.spsolve(S.A, b)
     t2 = time.perf_counter()
     return {"assembly": t1 - t0, "solve": t2 - t1, "total": t2 - t0}
+
+
+# ---------------------------------------------------------------------------
+# Slice-comparison figure helpers
+# ---------------------------------------------------------------------------
+
+def _slab_mask(bary, axis, plane_val):
+    return np.abs(bary[:, axis] - plane_val) < SLAB_HALF
+
+
+def _slice_axes(axis):
+    return [a for a in range(3) if a != axis]
+
+
+def _interp_slice(bary, values, mask, axis):
+    ax0, ax1 = _slice_axes(axis)
+    pts = bary[mask][:, [ax0, ax1]]
+    if len(pts) == 0:
+        xi = np.linspace(-1, 1, GRID_N)
+        yi = np.linspace(-1, 1, GRID_N)
+        return xi, yi, np.full((GRID_N, GRID_N), np.nan)
+    vals = values[mask]
+    lo0, hi0 = pts[:, 0].min(), pts[:, 0].max()
+    lo1, hi1 = pts[:, 1].min(), pts[:, 1].max()
+    xi = np.linspace(lo0, hi0, GRID_N)
+    yi = np.linspace(lo1, hi1, GRID_N)
+    Xg, Yg = np.meshgrid(xi, yi)
+    Zi = griddata(pts, vals, (Xg, Yg), method="linear")
+    return xi, yi, Zi
+
+
+def make_solver_comparison_figure(efields: dict, mesh):
+    """Generate a slice comparison figure for all available solvers.
+
+    Parameters
+    ----------
+    efields : dict
+        Mapping of label → (N_elem, 3) E-field array.
+        The first entry is treated as the reference (NumPy FEM).
+    mesh : TetMesh
+        The mesh (nodes in metres).
+    """
+    from tmswarp.conductor import element_barycenters
+
+    labels = list(efields.keys())
+    ref_label = labels[0]
+    E_ref = efields[ref_label]
+    mag_ref = np.linalg.norm(E_ref, axis=1)
+
+    bary = element_barycenters(mesh) * 1000  # m → mm
+
+    # Colour limits: 99th percentile of all solvers combined
+    all_mags = np.concatenate([np.linalg.norm(E, axis=1) for E in efields.values()])
+    vmax = np.percentile(all_mags, 99)
+    e_norm = Normalize(vmin=0, vmax=vmax)
+
+    # Difference colour limit: 98th percentile of absolute differences
+    all_diffs = np.concatenate([
+        np.abs(np.linalg.norm(E, axis=1) - mag_ref)
+        for E in list(efields.values())[1:]
+    ])
+    dlim = max(np.percentile(all_diffs, 98), 1e-9)
+    diff_norm = TwoSlopeNorm(vcenter=0, vmin=-dlim, vmax=dlim)
+
+    # Slice planes
+    slice_specs = [
+        (2, AXIAL_Z,    f"Axial z={AXIAL_Z:.0f} mm"),
+        (1, CORONAL_Y,  f"Coronal y={CORONAL_Y:.0f} mm"),
+        (0, SAGITTAL_X, f"Sagittal x={SAGITTAL_X:.0f} mm"),
+    ]
+    axis_labels = [["x (mm)", "y (mm)"], ["x (mm)", "z (mm)"], ["y (mm)", "z (mm)"]]
+
+    # Layout: reference column + (|E| + diff) per non-reference solver
+    n_warp = len(labels) - 1
+    n_cols = 1 + 2 * n_warp
+    n_rows = 3
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(4 * n_cols, 4.5 * n_rows),
+                             squeeze=False)
+
+    for row, (axis, plane_val, row_label) in enumerate(slice_specs):
+        mask = _slab_mask(bary, axis, plane_val)
+        xl, yl = axis_labels[axis][0], axis_labels[axis][1]
+
+        def _show(ax, xi, yi, Zi, norm, cmap, title):
+            extent = [xi[0], xi[-1], yi[0], yi[-1]]
+            ax.imshow(Zi, origin="lower", extent=extent,
+                      norm=norm, cmap=cmap, aspect="equal",
+                      interpolation="bilinear")
+            ax.set_title(title, fontsize=8)
+            ax.set_xlabel(xl, fontsize=7)
+            ax.set_ylabel(yl, fontsize=7)
+            ax.tick_params(labelsize=6)
+
+        # Reference column
+        xi, yi, Zi_ref = _interp_slice(bary, mag_ref, mask, axis)
+        _show(axes[row, 0], xi, yi, Zi_ref, e_norm, "hot",
+              f"{ref_label}\n|E|")
+        if row == 0:
+            axes[row, 0].set_ylabel(f"{row_label}\n{yl}", fontsize=7)
+
+        # One pair of columns per non-reference solver
+        for k, label in enumerate(labels[1:]):
+            mag_k = np.linalg.norm(efields[label], axis=1)
+            diff_k = mag_k - mag_ref
+
+            _, _, Zi_k    = _interp_slice(bary, mag_k,  mask, axis)
+            _, _, Zi_diff = _interp_slice(bary, diff_k, mask, axis)
+
+            col_e    = 1 + 2 * k
+            col_diff = 2 + 2 * k
+
+            _show(axes[row, col_e], xi, yi, Zi_k, e_norm, "hot",
+                  f"{label}\n|E|")
+            _show(axes[row, col_diff], xi, yi, Zi_diff, diff_norm, "RdBu_r",
+                  f"{label} − {ref_label}")
+
+    # Shared colour bars
+    fig.subplots_adjust(left=0.06, right=0.95, top=0.91,
+                        bottom=0.10, hspace=0.55, wspace=0.40)
+
+    cb_e = fig.colorbar(
+        cm.ScalarMappable(norm=e_norm, cmap="hot"),
+        ax=axes[:, 0], shrink=0.6, pad=0.02,
+        orientation="horizontal", fraction=0.03,
+    )
+    cb_e.set_label("|E| (V/m)", fontsize=9)
+
+    for k, label in enumerate(labels[1:]):
+        col_diff = 2 + 2 * k
+        cb_d = fig.colorbar(
+            cm.ScalarMappable(norm=diff_norm, cmap="RdBu_r"),
+            ax=axes[:, col_diff], shrink=0.6, pad=0.02,
+            orientation="horizontal", fraction=0.03,
+        )
+        cb_d.set_label(f"Δ|E| (V/m)  [{label}]", fontsize=8)
+
+    # Global stats in title
+    stats_lines = []
+    for label in labels[1:]:
+        from tmswarp.fields import rdm as _rdm, mag as _mag
+        rv = _rdm(efields[label], E_ref)
+        mv = _mag(efields[label], E_ref)
+        stats_lines.append(f"{label}: RDM={rv:.3f}  |MAG|={mv:.3f}")
+
+    machine = f"{platform.system()} {platform.machine()}"
+    fig.suptitle(
+        f"Solver E-field comparison — ernie head mesh  |  {machine}\n"
+        + "  |  ".join(stats_lines),
+        fontsize=10, y=0.97,
+    )
+
+    fig.savefig(str(COMPARISON_OUTPATH), dpi=150, bbox_inches="tight")
+    print(f"Saved: {COMPARISON_OUTPATH}")
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +479,11 @@ if __name__ == "__main__":
         from tmswarp.fields import compute_efield_at_elements, rdm, mag
         from tmswarp.solver_warp import warp_available
 
-        # E-field from NumPy reference — computed once, reused for all Warp runs
+        # E-field from NumPy reference — used for validation and comparison figure
         E_np_ref = compute_efield_at_elements(_mesh, phi_np, _dAdt, _G)
+
+        # Collect E-fields for the comparison figure: label → E array
+        efields_for_plot = {"NumPy FEM": E_np_ref}
 
         def _run_warp(label, device):
             """Time Warp.fem on one device, validate result, add to results."""
@@ -340,6 +509,8 @@ if __name__ == "__main__":
             if rdm_val > 1.0:
                 print("  WARNING: RDM > 1.0 — result is likely wrong (check CG convergence).")
 
+            efields_for_plot[f"Warp {label}"] = E_wp
+
         if warp_available():
             import warp as _wp
             _wp.init()
@@ -354,6 +525,11 @@ if __name__ == "__main__":
 
         with open(TIMING_CACHE, "w") as f:
             json.dump(results, f, indent=2)
+
+        # Slice comparison figure (only when we actually computed E-fields)
+        if len(efields_for_plot) > 1:
+            print("\nGenerating solver comparison figure ...")
+            make_solver_comparison_figure(efields_for_plot, _mesh)
 
     print_table(results)
     make_timing_plot(results)
