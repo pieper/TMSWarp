@@ -84,6 +84,50 @@ try:
         cell_sigma = sigma[s.element_index]
         return -cell_sigma * wp.dot(dAdt(s), fem.grad(v, s))
 
+    @wp.kernel
+    def _compute_enorm_kernel(
+        phi: wp.array(dtype=wp.float32),
+        elements: wp.array2d(dtype=wp.int32),
+        G: wp.array2d(dtype=wp.float32),
+        dAdt_nodes: wp.array(dtype=wp.vec3f),
+        enorm: wp.array(dtype=wp.float32),
+    ):
+        """Compute |E| per element on GPU.
+
+        E = -grad(phi) - dA/dt_bary
+        grad(phi)|_e = sum_i phi[elements[e,i]] * G[e, i*3+d]
+        dA/dt_bary   = mean of 4 nodal dAdt values
+        """
+        e = wp.tid()
+        n0 = elements[e, 0]
+        n1 = elements[e, 1]
+        n2 = elements[e, 2]
+        n3 = elements[e, 3]
+
+        p0 = phi[n0]
+        p1 = phi[n1]
+        p2 = phi[n2]
+        p3 = phi[n3]
+
+        # grad(phi) = sum_i phi_i * G[e, i, :]  (G stored as n_elem x 12)
+        gx = p0 * G[e, 0] + p1 * G[e, 3] + p2 * G[e, 6] + p3 * G[e, 9]
+        gy = p0 * G[e, 1] + p1 * G[e, 4] + p2 * G[e, 7] + p3 * G[e, 10]
+        gz = p0 * G[e, 2] + p1 * G[e, 5] + p2 * G[e, 8] + p3 * G[e, 11]
+
+        # dA/dt at barycenter = mean of 4 nodal values
+        d0 = dAdt_nodes[n0]
+        d1 = dAdt_nodes[n1]
+        d2 = dAdt_nodes[n2]
+        d3 = dAdt_nodes[n3]
+        dAdt_bary = wp.vec3f(
+            (d0[0] + d1[0] + d2[0] + d3[0]) * 0.25,
+            (d0[1] + d1[1] + d2[1] + d3[1]) * 0.25,
+            (d0[2] + d1[2] + d2[2] + d3[2]) * 0.25,
+        )
+
+        E = wp.vec3f(-gx - dAdt_bary[0], -gy - dAdt_bary[1], -gz - dAdt_bary[2])
+        enorm[e] = wp.length(E)
+
     _WARP_INTEGRANDS_DEFINED = True
 
 except ImportError:
@@ -357,16 +401,37 @@ class WarpFEMContext:
         self._total_iters = 0
         self._converged = False
 
+        # GPU arrays for E-field / Enorm computation
+        from tmswarp.solver import gradient_operator
+        n_elements = len(mesh.elements)
+        self._n_elements = n_elements
+        G_cpu = gradient_operator(mesh).astype(np.float32)  # (n_elem, 4, 3)
+        # Flatten to (n_elem, 12) for simple 2D indexing in kernel
+        self._G_wp = wp.array(
+            G_cpu.reshape(n_elements, 12),
+            dtype=wp.float32, device=self._device,
+        )
+        self._elements_wp = wp.array(
+            mesh.elements.astype(np.int32),
+            dtype=wp.int32, device=self._device,
+        ).reshape((n_elements, 4))
+        self._enorm_wp = wp.zeros(
+            n_elements, dtype=wp.float32, device=self._device
+        )
+        self._dAdt_wp = None  # set by set_rhs()
+
     def set_rhs(self, dAdt_nodes):
         """Assemble new RHS b for updated dA/dt.  Keep x for warm start."""
         import warp as wp
         import warp.fem as fem
 
         # Populate dAdt discrete field
-        dAdt_discrete = self._dAdt_space.make_field()
-        dAdt_discrete.dof_values = wp.array(
+        dAdt_wp = wp.array(
             dAdt_nodes.astype(np.float32), dtype=wp.vec3f, device=self._device
         )
+        self._dAdt_wp = dAdt_wp  # keep for compute_enorm()
+        dAdt_discrete = self._dAdt_space.make_field()
+        dAdt_discrete.dof_values = dAdt_wp
 
         # Assemble RHS
         self.b = fem.integrate(
@@ -409,6 +474,25 @@ class WarpFEMContext:
         import warp as wp
         wp.synchronize_device(self._device)
         return self.x.numpy().astype(np.float64)
+
+    def compute_enorm(self):
+        """Compute |E| per element entirely on GPU.
+
+        Returns (n_elements,) float64 numpy array.
+        Requires set_rhs() to have been called (for dAdt).
+        """
+        import warp as wp
+        if self._dAdt_wp is None:
+            raise RuntimeError("Call set_rhs() before compute_enorm()")
+        wp.launch(
+            _compute_enorm_kernel,
+            dim=self._n_elements,
+            inputs=[self.x, self._elements_wp, self._G_wp,
+                    self._dAdt_wp, self._enorm_wp],
+            device=self._device,
+        )
+        wp.synchronize_device(self._device)
+        return self._enorm_wp.numpy().astype(np.float64)
 
     @property
     def converged(self):
