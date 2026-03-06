@@ -259,3 +259,157 @@ def solve_fem_warp(
 
     # Return as float64 for compatibility with the rest of the pipeline
     return x.numpy().astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Incremental CG context for streaming solves
+# ---------------------------------------------------------------------------
+
+class WarpFEMContext:
+    """Persistent warp.fem state for incremental CG solves.
+
+    One-time cost: geometry construction, K assembly, gauge projector.
+    Then call ``set_rhs()`` for each new coil position, and ``step()``
+    repeatedly to advance CG.  ``x`` is kept across calls as a warm start.
+
+    Example
+    -------
+    >>> ctx = WarpFEMContext(mesh, device="cpu")
+    >>> ctx.set_rhs(dAdt_nodes)
+    >>> while True:
+    ...     err, iters, converged = ctx.step(n_iters=50)
+    ...     phi = ctx.get_phi()
+    ...     # compute E-field from phi, update visualization
+    ...     if converged:
+    ...         break
+    """
+
+    def __init__(self, mesh, pin_node=0, device=None, tol=1e-4):
+        if not _WARP_INTEGRANDS_DEFINED:
+            raise ImportError(
+                "warp-lang is required for WarpFEMContext. "
+                "Install it with: pip install warp-lang"
+            )
+        _init_warp()
+
+        import warp as wp
+        import warp.fem as fem
+
+        if device is None:
+            device = wp.get_preferred_device()
+
+        # Build geometry
+        positions = wp.array(
+            mesh.nodes.astype(np.float32), dtype=wp.vec3f, device=device
+        )
+        tet_indices = wp.array(
+            mesh.elements.astype(np.int32), dtype=int, device=device
+        )
+        geo = fem.Tetmesh(tet_indices, positions)
+
+        # Function spaces
+        self._phi_space = fem.make_polynomial_space(
+            geo, dtype=wp.float32, degree=1
+        )
+        self._dAdt_space = fem.make_polynomial_space(
+            geo, dtype=wp.vec3f, degree=1
+        )
+        self._sigma_wp = wp.array(
+            mesh.conductivity.astype(np.float32),
+            dtype=wp.float32, device=device,
+        )
+
+        # Assemble stiffness matrix K (one-time)
+        domain = fem.Cells(geometry=geo)
+        test = fem.make_test(space=self._phi_space, domain=domain)
+        trial = fem.make_trial(space=self._phi_space, domain=domain)
+        self._test = test
+        self._domain = domain
+        self.K = fem.integrate(
+            _tms_stiffness_form,
+            fields={"u": trial, "v": test},
+            values={"sigma": self._sigma_wp},
+            output_dtype=wp.float32,
+        )
+
+        # Gauge projector
+        n_nodes = len(mesh.nodes)
+        self._device = self.K.values.device
+        self._n_nodes = n_nodes
+        self._projector = _make_gauge_projector(
+            n_nodes, pin_node, device=self._device
+        )
+        self._fixed_val = wp.zeros(
+            n_nodes, dtype=wp.float32, device=self._device
+        )
+
+        # Apply gauge to K (idempotent — safe to re-apply with new b)
+        # We need a dummy b for the first projection of K
+        dummy_b = wp.zeros(n_nodes, dtype=wp.float32, device=self._device)
+        fem.project_linear_system(
+            self.K, dummy_b, self._projector, self._fixed_val
+        )
+
+        # Persistent solution vector (warm start across set_rhs calls)
+        self.x = wp.zeros(n_nodes, dtype=wp.float32, device=self._device)
+        self.b = None
+        self.tol = tol
+        self._total_iters = 0
+        self._converged = False
+
+    def set_rhs(self, dAdt_nodes):
+        """Assemble new RHS b for updated dA/dt.  Keep x for warm start."""
+        import warp as wp
+        import warp.fem as fem
+
+        # Populate dAdt discrete field
+        dAdt_discrete = self._dAdt_space.make_field()
+        dAdt_discrete.dof_values = wp.array(
+            dAdt_nodes.astype(np.float32), dtype=wp.vec3f, device=self._device
+        )
+
+        # Assemble RHS
+        self.b = fem.integrate(
+            _tms_rhs_form,
+            fields={"v": self._test, "dAdt": dAdt_discrete},
+            values={"sigma": self._sigma_wp},
+            output_dtype=wp.float32,
+        )
+
+        # Apply gauge to b (K already has gauge applied — idempotent)
+        fem.project_linear_system(
+            self.K, self.b, self._projector, self._fixed_val
+        )
+
+        self._total_iters = 0
+        self._converged = False
+
+    def step(self, n_iters=50):
+        """Run n_iters CG iterations from current x.
+
+        Returns (residual, total_iters, converged).
+        """
+        import warp as wp
+        from warp.examples.fem.utils import bsr_cg
+
+        if self.b is None:
+            raise RuntimeError("Call set_rhs() before step()")
+
+        err, iters = bsr_cg(
+            self.K, b=self.b, x=self.x,
+            max_iters=n_iters, tol=self.tol, quiet=True,
+        )
+        wp.synchronize_device(self._device)
+        self._total_iters += iters
+        self._converged = (err <= self.tol)
+        return err, self._total_iters, self._converged
+
+    def get_phi(self):
+        """Return current phi estimate as float64 numpy array."""
+        import warp as wp
+        wp.synchronize_device(self._device)
+        return self.x.numpy().astype(np.float64)
+
+    @property
+    def converged(self):
+        return self._converged
