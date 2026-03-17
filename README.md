@@ -4,6 +4,12 @@ TMS simulation utilities using [Nvidia Warp](https://github.com/NVIDIA/warp).
 
 Includes a pure-NumPy/SciPy FEM solver and a GPU-accelerated solver via `warp.fem`, both validated against the Heller & van Hulsteyn (1992) analytical solution on a spherical conductor.
 
+
+
+https://github.com/user-attachments/assets/1da92c75-caf3-43ce-b754-12fca91ae1b4
+
+Example interactions using an optimizer to maximize the electric field at a target point in the brain.  This leverages the diffential Warp-based simulation.
+
 ## Installation
 
 ```bash
