@@ -84,6 +84,88 @@ try:
         cell_sigma = sigma[s.element_index]
         return -cell_sigma * wp.dot(dAdt(s), fem.grad(v, s))
 
+    @wp.func
+    def _element_efield(
+        phi: wp.array(dtype=wp.float32),
+        elements: wp.array2d(dtype=wp.int32),
+        G: wp.array2d(dtype=wp.float32),
+        dAdt_nodes: wp.array(dtype=wp.vec3f),
+        e: int,
+    ):
+        """E = -grad(phi) - dA/dt_bary in element e (see _compute_enorm_kernel)."""
+        n0 = elements[e, 0]
+        n1 = elements[e, 1]
+        n2 = elements[e, 2]
+        n3 = elements[e, 3]
+
+        g0 = wp.vec3f(G[e, 0], G[e, 1], G[e, 2])
+        g1 = wp.vec3f(G[e, 3], G[e, 4], G[e, 5])
+        g2 = wp.vec3f(G[e, 6], G[e, 7], G[e, 8])
+        g3 = wp.vec3f(G[e, 9], G[e, 10], G[e, 11])
+
+        grad_phi = phi[n0] * g0 + phi[n1] * g1 + phi[n2] * g2 + phi[n3] * g3
+        dAdt_bary = (
+            dAdt_nodes[n0] + dAdt_nodes[n1] + dAdt_nodes[n2] + dAdt_nodes[n3]
+        ) * 0.25
+        return -grad_phi - dAdt_bary
+
+    @wp.kernel
+    def _dipole_dadt_kernel(
+        nodes: wp.array(dtype=wp.vec3f),
+        dipole_pos: wp.array(dtype=wp.vec3f),
+        dipole_moment: wp.array(dtype=wp.vec3f),
+        scale: wp.float32,
+        dAdt: wp.array(dtype=wp.vec3f),
+    ):
+        """Differentiable version of ``tmswarp.coil.magnetic_dipole_dadt``.
+
+        ``dipole_pos`` and ``dipole_moment`` are length-1 arrays so that
+        gradients with respect to them can be recorded on a ``wp.Tape``.
+        ``scale`` is (mu0/4pi) * dI/dt.
+        """
+        i = wp.tid()
+        r = nodes[i] - dipole_pos[0]
+        d = wp.length(r)
+        m = wp.normalize(dipole_moment[0])
+        dAdt[i] = scale * wp.cross(m, r) / (d * d * d)
+
+    @wp.kernel
+    def _target_loss_kernel(
+        phi: wp.array(dtype=wp.float32),
+        elements: wp.array2d(dtype=wp.int32),
+        G: wp.array2d(dtype=wp.float32),
+        dAdt_nodes: wp.array(dtype=wp.vec3f),
+        target_elem: int,
+        loss: wp.array(dtype=wp.float32),
+    ):
+        """loss = -|E| in the target element (minimizing maximizes |E|)."""
+        E = _element_efield(phi, elements, G, dAdt_nodes, target_elem)
+        loss[0] = -wp.length(E)
+
+    @wp.kernel
+    def _scale_kernel(
+        src: wp.array(dtype=wp.float32),
+        s: wp.float32,
+        dst: wp.array(dtype=wp.float32),
+    ):
+        i = wp.tid()
+        dst[i] = s * src[i]
+
+    @wp.kernel
+    def _add_kernel(
+        src: wp.array(dtype=wp.float32),
+        dst: wp.array(dtype=wp.float32),
+    ):
+        i = wp.tid()
+        dst[i] = dst[i] + src[i]
+
+    @wp.kernel
+    def _zero_entry_kernel(
+        a: wp.array(dtype=wp.float32),
+        index: int,
+    ):
+        a[index] = 0.0
+
     @wp.kernel
     def _compute_enorm_kernel(
         phi: wp.array(dtype=wp.float32),
@@ -380,6 +462,9 @@ class WarpFEMContext:
         n_nodes = len(mesh.nodes)
         self._device = self.K.values.device
         self._n_nodes = n_nodes
+        self._pin_node = pin_node
+        self._nodes_np = mesh.nodes
+        self._diff_ready = False  # differentiable state built on first use
         self._projector = _make_gauge_projector(
             n_nodes, pin_node, device=self._device
         )
@@ -497,3 +582,186 @@ class WarpFEMContext:
     @property
     def converged(self):
         return self._converged
+
+    # ------------------------------------------------------------------
+    # Differentiable objective (wp.Tape + adjoint linear solve)
+    # ------------------------------------------------------------------
+
+    def _ensure_diff_state(self):
+        """Allocate the arrays recorded on the tape (one-time)."""
+        if self._diff_ready:
+            return
+        import warp as wp
+
+        n = self._n_nodes
+        dev = self._device
+        self._nodes_wp = wp.array(
+            self._nodes_np.astype(np.float32), dtype=wp.vec3f, device=dev
+        )
+        self._pos_wp = wp.zeros(1, dtype=wp.vec3f, device=dev, requires_grad=True)
+        self._mom_wp = wp.zeros(1, dtype=wp.vec3f, device=dev, requires_grad=True)
+        self._dAdt_field = self._dAdt_space.make_field()
+        self._dAdt_field.dof_values.requires_grad = True
+        self._b_diff = wp.zeros(n, dtype=wp.float32, device=dev, requires_grad=True)
+        self._loss_wp = wp.zeros(1, dtype=wp.float32, device=dev, requires_grad=True)
+        self.x.requires_grad = True
+
+        # Work arrays for the solves (never recorded on the tape)
+        self._b_scaled = wp.zeros(n, dtype=wp.float32, device=dev)
+        self._x_scaled = wp.zeros(n, dtype=wp.float32, device=dev)
+        self._adj_rhs = wp.zeros(n, dtype=wp.float32, device=dev)
+        self._lam = wp.zeros(n, dtype=wp.float32, device=dev)
+        self._lam_target = None
+        self._diff_ready = True
+
+    def _solve_relative(self, b, x, rtol, max_iters):
+        """Solve K x = b to a residual of ``rtol * |b|``, warm-started from x.
+
+        bsr_cg stops at ``max(tol * |b|, tol)``, which is an absolute
+        threshold whenever |b| < 1.  Solving for x / |b| against b / |b|
+        makes the tolerance relative for any right-hand-side scale.
+
+        Returns (relative_residual, iterations).
+        """
+        import warp as wp
+        from warp.examples.fem.utils import bsr_cg
+
+        n = self._n_nodes
+        dev = self._device
+        b_norm = float(np.sqrt(wp.utils.array_inner(b, b)))
+        if b_norm == 0.0:
+            x.zero_()
+            return 0.0, 0
+
+        wp.launch(_scale_kernel, dim=n, inputs=[b, 1.0 / b_norm],
+                  outputs=[self._b_scaled], device=dev)
+        wp.launch(_scale_kernel, dim=n, inputs=[x, 1.0 / b_norm],
+                  outputs=[self._x_scaled], device=dev)
+        err, iters = bsr_cg(
+            self.K, b=self._b_scaled, x=self._x_scaled,
+            max_iters=max_iters, tol=rtol, quiet=True,
+        )
+        wp.launch(_scale_kernel, dim=n, inputs=[self._x_scaled, b_norm],
+                  outputs=[x], device=dev)
+        wp.synchronize_device(dev)
+        return float(err), int(iters)
+
+    def solve(self, dAdt_nodes, rtol=1e-4, max_iters=2000):
+        """set_rhs() then solve to a relative residual, warm-started from x.
+
+        Returns (relative_residual, iterations, converged).
+        """
+        self._ensure_diff_state()
+        self.set_rhs(dAdt_nodes)
+        err, iters = self._solve_relative(self.b, self.x, rtol, max_iters)
+        self._total_iters = iters
+        self._converged = err <= rtol
+        return err, iters, self._converged
+
+    def objective_and_gradient(self, dipole_pos, dipole_moment, target_elem,
+                               didt=1e6, rtol=1e-4, max_iters=2000):
+        """Evaluate loss = -|E[target_elem]| and its gradient by autodiff.
+
+        The dipole field, right-hand-side assembly and loss are recorded on
+        a ``wp.Tape``.  The linear solve is differentiated implicitly: its
+        backward step solves the adjoint system K lam = dL/dphi (K is
+        symmetric), so one gradient costs one extra solve regardless of
+        the number of parameters.
+
+        Parameters
+        ----------
+        dipole_pos : (3,) array
+            Dipole position in metres.
+        dipole_moment : (3,) array
+            Dipole moment direction (normalized internally).
+        target_elem : int
+            Index of the element whose |E| is maximized.
+        didt : float
+            Rate of current change dI/dt in A/s.
+        rtol : float
+            Relative residual tolerance for the forward and adjoint solves.
+        max_iters : int
+            Maximum CG iterations per solve.
+
+        Returns
+        -------
+        loss : float
+            -|E[target_elem]| in V/m.
+        grad_pos : (3,) float64 array
+            d(loss)/d(dipole_pos), per metre.
+        grad_moment : (3,) float64 array
+            d(loss)/d(dipole_moment).
+
+        After the call ``get_phi()`` and ``compute_enorm()`` return the
+        field for this dipole.
+        """
+        import warp as wp
+        import warp.fem as fem
+
+        self._ensure_diff_state()
+        n = self._n_nodes
+        dev = self._device
+        target_elem = int(target_elem)
+
+        self._pos_wp.assign(np.asarray(dipole_pos, dtype=np.float32).reshape(1, 3))
+        self._mom_wp.assign(np.asarray(dipole_moment, dtype=np.float32).reshape(1, 3))
+        dAdt = self._dAdt_field.dof_values
+        b = self._b_diff
+        x = self.x
+
+        tape = wp.Tape()
+        with tape:
+            wp.launch(
+                _dipole_dadt_kernel, dim=n,
+                inputs=[self._nodes_wp, self._pos_wp, self._mom_wp,
+                        float(1e-7 * didt)],
+                outputs=[dAdt], device=dev,
+            )
+            fem.integrate(
+                _tms_rhs_form,
+                fields={"v": self._test, "dAdt": self._dAdt_field},
+                values={"sigma": self._sigma_wp},
+                output=b,
+            )
+
+        # Gauge: K already has the pin row/column eliminated
+        wp.launch(_zero_entry_kernel, dim=1, inputs=[b, self._pin_node], device=dev)
+
+        err, iters = self._solve_relative(b, x, rtol, max_iters)
+
+        def adjoint_solve():
+            # dL/db = K^-1 dL/dphi
+            wp.copy(self._adj_rhs, x.grad)
+            wp.launch(_zero_entry_kernel, dim=1,
+                      inputs=[self._adj_rhs, self._pin_node], device=dev)
+            self._solve_relative(self._adj_rhs, self._lam, rtol, max_iters)
+            wp.launch(_add_kernel, dim=n, inputs=[self._lam],
+                      outputs=[b.grad], device=dev)
+
+        tape.record_func(adjoint_solve, arrays=(b, x))
+
+        if self._lam_target != target_elem:
+            self._lam.zero_()
+            self._lam_target = target_elem
+
+        with tape:
+            wp.launch(
+                _target_loss_kernel, dim=1,
+                inputs=[x, self._elements_wp, self._G_wp, dAdt, target_elem],
+                outputs=[self._loss_wp], device=dev,
+            )
+
+        tape.backward(loss=self._loss_wp)
+        wp.synchronize_device(dev)
+
+        loss = float(self._loss_wp.numpy()[0])
+        grad_pos = self._pos_wp.grad.numpy()[0].astype(np.float64)
+        grad_moment = self._mom_wp.grad.numpy()[0].astype(np.float64)
+        tape.zero()
+
+        # Keep the context consistent for step() / compute_enorm()
+        self.b = b
+        self._dAdt_wp = dAdt
+        self._total_iters = iters
+        self._converged = err <= rtol
+        return loss, grad_pos, grad_moment
