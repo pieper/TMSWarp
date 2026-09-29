@@ -22,13 +22,16 @@ A complete, working FEM solver using only numpy + scipy:
 
 - **`src/tmswarp/fields.py`** — Post-processing: `compute_efield_at_elements()` (E = -grad(phi) - dA/dt), plus `rdm()` and `mag()` validation metrics.
 
-### Test Results: 32 passed
+### Test Results: 42 passed
 
 All tests pass. Both FEM solvers validate against the analytical solution:
 - **NumPy FEM**: RDM = 0.192 (threshold < 0.2), MAG = 0.019 (threshold < log(1.1))
-- **Warp.fem**: RDM = 0.230 (threshold < 0.3 due to float32 geometry), MAG = 0.027
+- **Warp.fem**: RDM = 0.230, MAG = 0.027, with `solve_fem_warp()` at its default
+  `tol=1e-4` (test threshold relaxed to < 0.3)
 
-These thresholds match SimNIBS's own validation criteria.
+The NumPy thresholds match SimNIBS's own validation criteria.  The Warp numbers
+are worse because of the default CG stopping tolerance, not because of float32;
+see "CG tolerance semantics" below.
 
 ### SimNIBS sphere3 Validation
 
@@ -39,9 +42,8 @@ The `sphere3_data.npz` file (22 704 tets, 4 556 nodes) is extracted from SimNIBS
 
 Results on the SimNIBS mesh (same dipole config as SimNIBS's own test_fem.py):
 - **NumPy FEM**: RDM = 0.169, MAG = 0.015 — **passes SimNIBS < 0.2 / < log(1.1)**
-- **Warp.fem**: RDM = 0.198, MAG = 0.020 — passes relaxed thresholds
-
-The Warp.fem result nearly meets SimNIBS's strict RDM < 0.2 threshold despite float32 geometry.
+- **Warp.fem**: RDM = 0.198, MAG = 0.020 at the default `tol=1e-4`; RDM = 0.169
+  (the same as NumPy) at `tol=1e-7`
 
 ### Ernie Human Head Mesh Validation
 
@@ -62,13 +64,26 @@ Results on the ernie mesh (dipole at z=200mm, 6 tissues, Apple Silicon CPU):
 | Solver    | Time   | vs NumPy | E-field (mean/max V/m) | Note |
 |-----------|--------|----------|----------------------|------|
 | NumPy FEM | 246 s  | —        | 0.484 / 41.2         | float64, direct solve |
-| Warp.fem  | 111 s  | 2.21×    | 0.569 / 49.4         | float32, CG |
+| Warp.fem  | 111 s  | 2.21×    | 0.569 / 49.4         | float32, CG, default `tol=1e-4` |
 
-**Known limitation**: Warp.fem uses float32 geometry and arithmetic throughout. For the ernie
-mesh with 165:1 conductivity contrast (skull σ=0.01 vs CSF σ=1.654), float32 precision
-degrades the accuracy significantly (RDM = 0.53 between solvers). This is expected — the
-sphere3 validation with uniform conductivity gives RDM = 0.06. GPU acceleration will be
-most impactful once a float64 or mixed-precision GPU path is implemented.
+**The Warp row is an under-converged solve, not a float32 limit.**  The
+difference from NumPy (RDM = 0.53, MAG = 0.21) comes from the default CG
+stopping tolerance.  Measured September 2026 on the same mesh and dipole,
+cold start, against a float64 CG reference (Jacobi, rtol=1e-10); results
+were identical on an RTX 3070 and on CPU (Warp 1.17.0):
+
+| Warp float32 solve                     | CG iterations | RDM    | MAG    | mean / max V/m |
+|----------------------------------------|---------------|--------|--------|----------------|
+| `solve_fem_warp()`, default `tol=1e-4` | 170           | 0.5304 | 0.2073 | 0.569 / 49.46  |
+| `WarpFEMContext.solve(rtol=1e-3)`      | 325           | 0.1208 | 0.0070 | 0.486 / 40.96  |
+| `WarpFEMContext.solve(rtol=1e-4)`      | 700           | 0.0019 | 0.0000 | 0.484 / 41.08  |
+| `WarpFEMContext.solve(rtol=1e-5)`      | 784           | 0.0004 | 0.0000 | 0.484 / 41.17  |
+| `WarpFEMContext.solve(rtol=1e-6)`      | 857           | 0.0003 | 0.0000 | 0.484 / 41.16  |
+
+So float32 agrees with the float64 reference to RDM = 0.0003 on this mesh,
+despite the 165:1 conductivity contrast (skull 0.01 vs CSF 1.654 S/m).  The
+111 s timing above is for the under-converged solve; a converged one takes
+about four times as many iterations.
 
 ### Convergence (Delaunay meshes, P1 elements)
 
@@ -85,7 +100,9 @@ The slow RDM convergence is due to Delaunay mesh quality (slivers, irregular ele
 ### Warp.fem Implementation
 
 - **`src/tmswarp/solver_warp.py`** — Warp.fem solver. Key design:
-  - `warp.fem.Tetmesh` requires float32 node positions; all FEM is float32
+  - All FEM is float32.  Warp 1.9.1 required it (`fem.Tetmesh` accepted only
+    float32 positions); Warp >= 1.13 supports float64 in `warp.fem`, not yet
+    used or tested here
   - Per-element sigma passed as `wp.array(dtype=wp.float32)`, accessed via `s.element_index`
   - dA/dt as a P1 discrete vector field (`dtype=wp.vec3f`)
   - Gauge (phi[0]=0) via `fem.project_linear_system` with a single-entry BSR projector
@@ -112,9 +129,8 @@ position and moment, computed with Warp autodiff:
 - Validated in `tests/test_solver_warp.py::TestWarpGradient` against float64
   central finite differences of the NumPy direct solver.  On sphere3 the
   gradient agrees to about 1e-5 (rtol=1e-6) and 3e-4 (rtol=1e-4).
-- Tested on CPU with Warp 1.9.1 only.  Not yet run on a GPU or on Warp >= 1.10
-  (no Intel Mac wheels after 1.9.1); the APIs used were checked against the
-  1.17.0 source.
+- Tested on CPU with Warp 1.9.1 (the last release with Intel Mac wheels) and
+  on an RTX 3070 with Warp 1.17.0.
 
 ### Surface constraint for the optimizer
 
@@ -139,11 +155,16 @@ projection to 35.99 / 18.22 / 71.93 V/m.
 
 `bsr_cg(tol=...)` stops at `max(tol * |b|, tol)`.  For this problem |b| is about
 1e-3, so `tol=1e-4` in `solve_fem_warp()` and `WarpFEMContext.step()` is an
-absolute threshold, roughly a 5% relative residual, reached in 10-30
-iterations.  Measured on sphere3 with layered conductivity (0.275/0.010/0.465),
-cold start, against the float64 direct solve: RDM 1.10 at `tol=1e-4`, 0.011 at
-`tol=1e-7`.  So the Warp-vs-NumPy differences reported below are mostly the
-stopping tolerance, not float32.
+absolute threshold, roughly a 3-7% relative residual.  Measured on sphere3 with
+layered conductivity (0.275/0.010/0.465), cold start, against the float64
+direct solve: RDM 1.10 at `tol=1e-4`, 0.011 at `tol=1e-7`.  The ernie
+measurements are in the table above.  The Warp-vs-NumPy differences in this
+file come from the stopping tolerance, not from float32.
+
+The defaults of `solve_fem_warp()` and `WarpFEMContext.step()` have not been
+changed, so the tests, benchmarks and figures that call them still produce
+under-converged Warp results.  `benchmarks/ernie_validation.py` still prints
+the float32 explanation.
 
 `WarpFEMContext.solve()` and `objective_and_gradient()` take `rtol`, a true
 relative tolerance (they solve the system scaled by 1/|b|).  TMSService uses
@@ -186,8 +207,8 @@ Total E-field: `E = -∇φ - ∂A/∂t`
 ### Warp.fem Implementation Notes (DONE — see solver_warp.py)
 
 Key lessons learned during implementation:
-- `fem.Tetmesh` requires `wp.vec3f` (float32) positions — float64 fails at kernel launch
-- All FEM quantities must be float32 to match; mixed precision fails with "scalar type mismatch"
+- With Warp 1.9.1, `fem.Tetmesh` requires `wp.vec3f` (float32) positions — float64 fails at kernel launch
+- All FEM quantities must match the geometry's precision; mixing fails with "scalar type mismatch"
 - Per-element conductivity: use `wp.array(dtype=wp.float32)`, indexed via `s.element_index`
 - dA/dt: create a separate `make_polynomial_space(geo, dtype=wp.vec3f)` space, then `make_field()`
 - Gauge: `bsr_zeros(n,n,wp.float32)` + `bsr_set_from_triplets` + `fem.project_linear_system`
@@ -222,7 +243,7 @@ For context on the integration target:
 
 - Use `pixi` for environment management (pixi.toml is in the repo)
 - `pixi install` sets up the environment (includes warp-lang via [pypi-dependencies])
-- `pixi run pytest -v` to run tests (28 tests, all pass)
+- `pixi run pytest -v` to run tests (42 tests, all pass)
 - `pixi run python visualize_convergence.py` to regenerate comparison plots
 - pixi.toml has `osx-64`, `osx-arm64`, and `linux-64` platforms
 - warp-lang ships a universal2 macOS binary that works on both Intel and Apple Silicon
