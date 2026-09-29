@@ -94,6 +94,61 @@ The slow RDM convergence is due to Delaunay mesh quality (slivers, irregular ele
   - **Integrands must be module-level** (warp uses `inspect.getsource` for JIT)
   - `warp_available()` guards import so module loads without warp installed
 
+### Differentiable objective (added September 2026)
+
+`WarpFEMContext.objective_and_gradient(dipole_pos, dipole_moment, target_elem)`
+returns loss = -|E[target_elem]| and its gradient with respect to dipole
+position and moment, computed with Warp autodiff:
+
+- The dipole field (`_dipole_dadt_kernel`), the RHS assembly (`fem.integrate`
+  of `_tms_rhs_form`) and the loss (`_target_loss_kernel`) are recorded on a
+  `wp.Tape`.
+- The CG solve is not taped.  Its backward step is registered with
+  `tape.record_func` and solves the adjoint system K lam = dL/dphi, following
+  `warp/examples/fem/example_darcy_ls_optimization.py`.  One gradient costs one
+  extra solve.
+- `SlicerTMS/Experiments/TMSService.py` uses this for the Warp optimization
+  path (it previously used finite differences, four solves per iteration).
+- Validated in `tests/test_solver_warp.py::TestWarpGradient` against float64
+  central finite differences of the NumPy direct solver.  On sphere3 the
+  gradient agrees to about 1e-5 (rtol=1e-6) and 3e-4 (rtol=1e-4).
+- Tested on CPU with Warp 1.9.1 only.  Not yet run on a GPU or on Warp >= 1.10
+  (no Intel Mac wheels after 1.9.1); the APIs used were checked against the
+  1.17.0 source.
+
+### Surface constraint for the optimizer
+
+`src/tmswarp/surface.py` has `closest_point_on_triangles()` and
+`vertex_normals()`.  TMSService uses them to keep the coil on the scalp:
+`_project_to_surface()` returns the closest point on the boundary triangles
+plus the offset along a normal interpolated from vertex normals, so position
+and orientation vary continuously.  (Projecting to face centres made the
+refinement stick on one face.)
+
+Because the moment follows the surface normal, moving the coil also rotates
+it.  `_surface_gradient()` combines the autodiff gradients with respect to
+position and moment through central differences of the projection, and
+returns a tangent vector.  The Adam step size decays by `OPT_LR_DECAY` per
+iteration, and the best position found is the one returned.
+
+On ernie (RTX 3070, targets at (-40,-10,60), (-40,40,40), (30,-80,10) mm) the
+final |E| at the target went from 32.68 / 16.22 / 67.86 V/m with face-centre
+projection to 35.99 / 18.22 / 71.93 V/m.
+
+### CG tolerance semantics
+
+`bsr_cg(tol=...)` stops at `max(tol * |b|, tol)`.  For this problem |b| is about
+1e-3, so `tol=1e-4` in `solve_fem_warp()` and `WarpFEMContext.step()` is an
+absolute threshold, roughly a 5% relative residual, reached in 10-30
+iterations.  Measured on sphere3 with layered conductivity (0.275/0.010/0.465),
+cold start, against the float64 direct solve: RDM 1.10 at `tol=1e-4`, 0.011 at
+`tol=1e-7`.  So the Warp-vs-NumPy differences reported below are mostly the
+stopping tolerance, not float32.
+
+`WarpFEMContext.solve()` and `objective_and_gradient()` take `rtol`, a true
+relative tolerance (they solve the system scaled by 1/|b|).  TMSService uses
+`--opt-rtol` (default 1e-3) for all solves during optimization.
+
 ### Timing (Apple Silicon CPU, cached kernels)
 
 | Elements | NumPy FEM (s) | Warp.fem CPU (s) | Note |
