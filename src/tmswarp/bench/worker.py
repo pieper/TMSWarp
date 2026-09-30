@@ -400,8 +400,10 @@ def main(argv):
     except MemoryError:
         result = {"status": "out-of-memory", "error": traceback.format_exc()}
     except Exception as exc:
-        status = "out-of-memory" if "out of memory" in str(exc).lower() else "error"
-        result = {"status": status, "error": traceback.format_exc()}
+        text = str(exc).lower()
+        oom = "out of memory" in text or "failed to allocate" in text
+        result = {"status": "out-of-memory" if oom else "error",
+                  "error": traceback.format_exc()}
     result["job"] = job
     result["t_job_total"] = time.perf_counter() - t0
     tmp = result_path + ".part"
