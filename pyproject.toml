@@ -34,6 +34,10 @@ dependencies = [
 gpu = [
     "warp-lang",
 ]
+bench = [
+    "warp-lang",
+    "meshio",
+]
 test = [
     "pytest>=7",
 ]
