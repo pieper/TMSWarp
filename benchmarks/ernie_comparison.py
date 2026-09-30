@@ -10,9 +10,15 @@ Prerequistes
 
 Usage
 -----
-    pixi run python benchmarks/ernie_comparison.py
+    pixi run python benchmarks/ernie_comparison.py                 # Warp solver
+    pixi run python benchmarks/ernie_comparison.py --solver numpy  # NumPy solver
+
+The Warp solver is run to a relative residual of ``--rtol`` (default 1e-6).
+The default tolerance of ``solve_fem_warp()`` stops much earlier; see
+"CG tolerance semantics" in CLAUDE.md.
 """
 
+import argparse
 from pathlib import Path
 
 import matplotlib
@@ -36,6 +42,7 @@ ERNIE_MESH_PATH   = ROOT / "ernie_data.npz"
 SIMNIBS_PATH      = ROOT / "ernie_simnibs_efield.npz"
 TMSWARP_CACHE     = ROOT / "ernie_tmswarp_efield.npz"
 OUTPATH           = ROOT / "ernie_comparison.png"
+OUTPATH_NUMPY     = ROOT / "ernie_comparison_numpy.png"
 
 # ---------------------------------------------------------------------------
 # Dipole parameters (must match scripts/run_simnibs_efield.py)
@@ -57,6 +64,49 @@ TISSUE_NAMES = {1: "WM", 2: "GM", 3: "CSF", 4: "skull", 5: "scalp", 6: "eyes"}
 # ---------------------------------------------------------------------------
 # Load TMSWarp mesh and compute E-field
 # ---------------------------------------------------------------------------
+
+def _load_mesh():
+    if not ERNIE_MESH_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing {ERNIE_MESH_PATH}\nRun: /path/to/SimNIBS-4.5/.../python scripts/fetch_ernie.py"
+        )
+    data = np.load(ERNIE_MESH_PATH)
+    mesh = TetMesh(
+        nodes=data["nodes"].astype(np.float64),
+        elements=data["elements"].astype(np.int32),
+        conductivity=data["conductivity"].astype(np.float64),
+    )
+    return mesh, data["tag1"].astype(np.int32)
+
+
+def compute_warp_efield(rtol, device):
+    """Solve with the Warp solver (float32 CG) to a relative residual.
+
+    Returns (E, bary_mm, tag1, description).
+    """
+    import warp as wp
+
+    from tmswarp.solver_warp import WarpFEMContext
+
+    mesh, tag1 = _load_mesh()
+    dAdt = magnetic_dipole_dadt(DIPOLE_POS_M, DIPOLE_MOMENT, DIDT, mesh.nodes)
+    ctx = WarpFEMContext(mesh, device=device)
+    err, iters, converged = ctx.solve(dAdt, rtol=rtol, max_iters=20000)
+    if not converged:
+        raise RuntimeError(
+            f"Warp CG did not reach rtol={rtol:g} (residual {err:.2e} "
+            f"after {iters} iterations)"
+        )
+    E = compute_efield_at_elements(mesh, ctx.get_phi(), dAdt, gradient_operator(mesh))
+    bary = element_barycenters(mesh) * 1000  # m → mm
+    description = (
+        f"Warp {wp.__version__} float32 CG, rtol={rtol:g}, "
+        f"{iters} iterations, {ctx._device}"
+    )
+    print(f"  {description}")
+    print(f"  TMSWarp |E| mean={np.linalg.norm(E,axis=1).mean():.3f} max={np.linalg.norm(E,axis=1).max():.3f} V/m")
+    return E, bary, tag1, description
+
 
 def load_tmswarp_efield():
     """Load TMSWarp NumPy FEM result from cache, or compute and cache it."""
@@ -104,8 +154,10 @@ def load_simnibs_efield():
     E      = data["E"]
     bary   = data["bary_mm"]
     tag1   = data["tag1"]
+    solver = str(data["solver"]) if "solver" in data else "SimNIBS"
+    print(f"  {solver}")
     print(f"  SimNIBS  |E| mean={np.linalg.norm(E,axis=1).mean():.3f} max={np.linalg.norm(E,axis=1).max():.3f} V/m")
-    return E, bary, tag1
+    return E, bary, tag1, solver
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +205,17 @@ def _axis_labels(axis: int):
 # Main figure
 # ---------------------------------------------------------------------------
 
-def make_comparison_figure(E_tw, bary_tw, E_sn, bary_sn):
+def make_comparison_figure(E_tw, bary_tw, E_sn, bary_sn,
+                           tmswarp_label="TMSWarp", simnibs_label="SimNIBS",
+                           outpath=OUTPATH):
     """Create a 3-row × 4-column figure comparing TMSWarp vs SimNIBS slices."""
+
+    # The difference maps and the RDM compare element by element
+    if E_tw.shape != E_sn.shape or not np.allclose(bary_tw, bary_sn, atol=1e-3):
+        raise ValueError(
+            "TMSWarp and SimNIBS results are not on the same elements in the "
+            "same order"
+        )
 
     mag_tw = np.linalg.norm(E_tw, axis=1)
     mag_sn = np.linalg.norm(E_sn, axis=1)
@@ -251,13 +312,15 @@ def make_comparison_figure(E_tw, bary_tw, E_sn, bary_sn):
     mag_val = float(abs(np.log(np.linalg.norm(E_tw) / np.linalg.norm(E_sn))))
     fig.suptitle(
         f"TMSWarp vs SimNIBS — ernie head mesh\n"
+        f"TMSWarp: {tmswarp_label}   |   SimNIBS: {simnibs_label}\n"
         f"Dipole at (0, 0, 200 mm), dI/dt=1 MA/s  |  "
-        f"Global RDM={rdm_val:.3f}  |MAG|={mag_val:.3f}",
-        fontsize=13, y=0.98,
+        f"Global RDM={rdm_val:.4f}  |MAG|={mag_val:.4f}",
+        fontsize=13, y=0.99,
     )
 
-    fig.savefig(str(OUTPATH), dpi=150, bbox_inches="tight")
-    print(f"\nSaved: {OUTPATH}")
+    fig.savefig(str(outpath), dpi=150, bbox_inches="tight")
+    print(f"\nGlobal RDM={rdm_val:.4f}  |MAG|={mag_val:.4f}")
+    print(f"Saved: {outpath}")
     plt.close()
 
 
@@ -268,18 +331,36 @@ def make_comparison_figure(E_tw, bary_tw, E_sn, bary_sn):
 if __name__ == "__main__":
     import time
 
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--solver", default="warp", choices=("warp", "numpy"),
+                        help="TMSWarp solver to compare (default: warp)")
+    parser.add_argument("--rtol", type=float, default=1e-6,
+                        help="Relative CG residual for the Warp solver")
+    parser.add_argument("--device", default=None,
+                        help="Warp device, e.g. cuda:0 or cpu (default: preferred)")
+    args = parser.parse_args()
+
     print("=" * 66)
     print("TMSWarp vs SimNIBS ernie comparison")
     print("=" * 66)
 
     print("\nLoading SimNIBS result ...")
-    E_sn, bary_sn, tag1_sn = load_simnibs_efield()
+    E_sn, bary_sn, tag1_sn, simnibs_label = load_simnibs_efield()
 
     print("\nComputing TMSWarp result ...")
     t0 = time.perf_counter()
-    E_tw, bary_tw, tag1_tw = load_tmswarp_efield()
+    if args.solver == "warp":
+        E_tw, bary_tw, tag1_tw, tmswarp_label = compute_warp_efield(
+            args.rtol, args.device
+        )
+        outpath = OUTPATH
+    else:
+        E_tw, bary_tw, tag1_tw = load_tmswarp_efield()
+        tmswarp_label = "NumPy float64, SciPy direct solve"
+        outpath = OUTPATH_NUMPY
     t_tw = time.perf_counter() - t0
     print(f"  TMSWarp solve: {t_tw:.1f} s")
 
     print("\nGenerating comparison figure ...")
-    make_comparison_figure(E_tw, bary_tw, E_sn, bary_sn)
+    make_comparison_figure(E_tw, bary_tw, E_sn, bary_sn,
+                           tmswarp_label, simnibs_label, outpath)

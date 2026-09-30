@@ -2,7 +2,12 @@
 
 Must be run with SimNIBS Python:
 
-    /path/to/SimNIBS-4.5/simnibs_env/bin/python scripts/run_simnibs_efield.py
+    /path/to/SimNIBS/simnibs_env/bin/python scripts/run_simnibs_efield.py
+
+By default the system is solved with SimNIBS's own solver (its default is
+PETSc CG with a hypre BoomerAMG preconditioner).  Pass ``--solver scipy`` to
+solve SimNIBS's assembled system with SciPy's sparse direct solver instead,
+which was the behaviour of earlier versions of this script.
 
 Prerequisite: ernie.msh must exist (extracted when fetch_ernie.py was run, or
 available in the ernie_dataset/ directory).  The script searches common locations.
@@ -22,12 +27,22 @@ ernie_simnibs_efield.npz  in the TMSWarp directory:
     tag1    int32   (N_elem,)    tissue tag
 """
 
+import argparse
 import os
 import sys
 import time
 
 import numpy as np
 import scipy.sparse.linalg as spalg
+
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+parser.add_argument(
+    "--solver", default="simnibs", choices=("simnibs", "scipy"),
+    help="simnibs: SimNIBS's own default solver; scipy: spsolve on "
+         "SimNIBS's assembled system",
+)
+parser.add_argument("--mesh", default=None, help="Path to ernie.msh")
+args = parser.parse_args()
 
 # Add SimNIBS to path
 SIMNIBS_SITE = (
@@ -42,6 +57,7 @@ for candidate in [
         sys.path.insert(0, candidate)
         break
 
+import simnibs
 from simnibs.mesh_tools import mesh_io
 from simnibs.simulation import fem as simfem
 
@@ -55,6 +71,9 @@ ERNIE_CANDIDATES = [
     "/tmp/ernie_lowres/m2m_ernie/ernie.msh",
     os.path.join(ROOT, "ernie_dataset", "m2m_ernie", "ernie.msh"),
 ]
+
+if args.mesh:
+    ERNIE_CANDIDATES.insert(0, args.mesh)
 
 ernie_path = None
 for c in ERNIE_CANDIDATES:
@@ -121,9 +140,18 @@ b = S.assemble_rhs(dAdt_node)
 t_assemble = time.perf_counter() - t0
 print(f"  Assembly: {t_assemble:.2f} s")
 
-print("Solving (scipy spsolve) ...")
 t1 = time.perf_counter()
-x = spalg.spsolve(S.A, b)
+if args.solver == "simnibs":
+    solver_name = (f"SimNIBS {simnibs.__version__} default solver "
+                   f"({getattr(S, '_solver_options', 'default')})")
+    print(f"Solving ({solver_name}) ...")
+    x = S.solve(b)
+else:
+    solver_name = f"SimNIBS {simnibs.__version__} assembly, SciPy spsolve"
+    print(f"Solving ({solver_name}) ...")
+    # S.A is the full matrix, without the grounded node eliminated.  E does
+    # not depend on the constant offset this leaves in the potential.
+    x = spalg.spsolve(S.A, b)
 t_solve = time.perf_counter() - t1
 print(f"  Solve:    {t_solve:.2f} s")
 print(f"  Total:    {t_assemble + t_solve:.2f} s")
@@ -147,7 +175,8 @@ print(f"  mean={mag_E.mean():.3f}  max={mag_E.max():.3f}  p99={np.percentile(mag
 # ---------------------------------------------------------------------------
 # Save
 # ---------------------------------------------------------------------------
-np.savez_compressed(OUTPATH, E=E, bary_mm=bary_mm, tag1=tag1)
+np.savez_compressed(OUTPATH, E=E, bary_mm=bary_mm, tag1=tag1,
+                    solver=np.array(solver_name))
 size_mb = os.path.getsize(OUTPATH) / 1e6
 print(f"\nSaved: {OUTPATH}  ({size_mb:.1f} MB)")
 print("\nNow run the comparison figure:")

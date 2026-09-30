@@ -54,10 +54,23 @@ example dataset (not committed to git — it's 19 MB and separately licensed):
 
 The script downloads from `https://github.com/simnibs/example-dataset/releases/download/v4.0-lowres/ernie_lowres_V2.zip`.
 
-**Comparison figure**: `ernie_comparison.png` — axial/coronal/sagittal slices of |E|, with
-TMSWarp vs SimNIBS side-by-side and absolute + relative difference maps.
-Generate via: `scripts/run_simnibs_efield.py` (SimNIBS Python) then `benchmarks/ernie_comparison.py` (pixi).
-TMSWarp NumPy FEM and SimNIBS FEM are numerically identical (RDM=0.000, |MAG|=0.000).
+**Comparison figures**: axial/coronal/sagittal slices of |E|, with TMSWarp vs
+SimNIBS side-by-side and absolute + relative difference maps.
+
+| Figure | TMSWarp solver | RDM | \|MAG\| |
+|--------|----------------|-----|---------|
+| `ernie_comparison.png` | Warp float32 CG, rtol=1e-6, RTX 3070 | 0.0003 | 0.0000 |
+| `ernie_comparison_numpy.png` | NumPy float64, SciPy direct solve | 0.0000 | 0.0000 |
+
+Both compare against SimNIBS 4.6.0 solving with its own default solver (PETSc
+CG with hypre BoomerAMG).  Before September 2026 `ernie_comparison.png` showed
+the NumPy solver against SimNIBS's assembled system solved with SciPy.
+
+Generate via `scripts/run_simnibs_efield.py` (SimNIBS Python; `--solver scipy`
+gives the old behaviour), then `benchmarks/ernie_comparison.py` (`--solver
+warp` is the default, `--solver numpy` writes the second figure).  The dipole
+field is computed with the same formula on both sides, so the figures compare
+the FEM solves, not the coil models.
 
 Results on the ernie mesh (dipole at z=200mm, 6 tissues, Apple Silicon CPU):
 
@@ -69,8 +82,8 @@ Results on the ernie mesh (dipole at z=200mm, 6 tissues, Apple Silicon CPU):
 **The Warp row is an under-converged solve, not a float32 limit.**  The
 difference from NumPy (RDM = 0.53, MAG = 0.21) comes from the default CG
 stopping tolerance.  Measured September 2026 on the same mesh and dipole,
-cold start, against a float64 CG reference (Jacobi, rtol=1e-10); results
-were identical on an RTX 3070 and on CPU (Warp 1.17.0):
+cold start, on an RTX 3070 (Warp 1.17.0), against a float64 CG reference
+(Jacobi, rtol=1e-10):
 
 | Warp float32 solve                     | CG iterations | RDM    | MAG    | mean / max V/m |
 |----------------------------------------|---------------|--------|--------|----------------|
@@ -84,6 +97,21 @@ So float32 agrees with the float64 reference to RDM = 0.0003 on this mesh,
 despite the 165:1 conductivity contrast (skull 0.01 vs CSF 1.654 S/m).  The
 111 s timing above is for the under-converged solve; a converged one takes
 about four times as many iterations.
+
+Timing on the same machine (12 cores, RTX 3070), ernie, cold start:
+
+| Solver | Setup | Solve | RDM vs SimNIBS |
+|--------|-------|-------|----------------|
+| SimNIBS 4.6.0, hypre, CPU | 2.7 s assembly + 0.6 s solver setup | 1.7 s | — |
+| Warp GPU, rtol=1e-3 | 0.7 s assembly | 0.12 s (325 iterations) | 0.1208 |
+| Warp GPU, rtol=1e-4 | 0.7 s | 0.22 s (700) | 0.0019 |
+| Warp GPU, rtol=1e-6 | 0.7 s | 0.26 s (857) | 0.0003 |
+| Warp CPU, rtol=1e-3 | 12 s | 194 s (330) | 0.1209 |
+| Warp CPU, rtol=1e-4 | 12 s | 410 s (700) | 0.0020 |
+| Warp CPU, rtol=1e-6 | 12 s | 500 s (860) | 0.0003 |
+| NumPy, SciPy direct | — | 1098 s in total | 0.0000 |
+
+The NumPy run shared the machine with other jobs.
 
 ### Convergence (Delaunay meshes, P1 elements)
 
@@ -150,6 +178,15 @@ iteration, and the best position found is the one returned.
 On ernie (RTX 3070, targets at (-40,-10,60), (-40,40,40), (30,-80,10) mm) the
 final |E| at the target went from 32.68 / 16.22 / 67.86 V/m with face-centre
 projection to 35.99 / 18.22 / 71.93 V/m.
+
+### Device handling
+
+Until September 2026 `solve_fem_warp()` and `WarpFEMContext` ignored a
+requested device of `"cpu"` on machines with CUDA: `warp.fem` allocates on
+Warp's default device, so everything ran on the GPU.  They now do all their
+work inside `wp.ScopedDevice(device)`.  Any "Warp CPU" number measured on a
+CUDA machine before that fix was a GPU run.  The CPU-only benchmark results
+in `benchmarks/results/` are not affected.
 
 ### CG tolerance semantics
 
