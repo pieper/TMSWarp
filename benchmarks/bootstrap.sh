@@ -20,6 +20,12 @@
 
 set -euo pipefail
 
+# Everything is inside main(), called on the last line, so that the whole
+# script has been read before anything runs.  With "curl ... | bash" the
+# script arrives on standard input, and a child process that reads standard
+# input would otherwise consume the rest of the script.
+main() {
+
 SUITE="standard"
 LABEL=""
 PROVIDER=""
@@ -84,8 +90,8 @@ if [ ! -x venv/bin/python ]; then
     fi
   fi
 fi
-venv/bin/python -m pip install --quiet --upgrade pip
-venv/bin/python -m pip install --quiet -e "TMSWarp[bench]" rpyc
+venv/bin/python -m pip install --quiet --upgrade pip < /dev/null
+venv/bin/python -m pip install --quiet -e "TMSWarp[bench]" rpyc < /dev/null
 venv/bin/python -c "import warp, tmswarp; print('    warp', warp.__version__)"
 
 # --- The optimizer, which lives in SlicerTMS --------------------------------
@@ -120,14 +126,27 @@ url = ("https://github.com/simnibs/simnibs/releases/download/"
 urllib.request.urlretrieve(url, "simnibs_installer_linux.tar.gz")
 PY
     tar xzf simnibs_installer_linux.tar.gz
-    ./simnibs_installer/install -s -t "$WORK/SimNIBS" > simnibs_install.log 2>&1
+    # The post-install step can ask a question (when a gmsh configuration
+    # already exists) and its failure does not affect the solvers, so the
+    # install is judged by whether SimNIBS imports.
+    rm -rf "$WORK/SimNIBS"
+    ./simnibs_installer/install -s -t "$WORK/SimNIBS" \
+      > simnibs_install.log 2>&1 < <(yes Y) || true
     rm -rf simnibs_installer simnibs_installer_linux.tar.gz
   else
     echo "    the SimNIBS installer used here is for Linux x86_64; skipping"
   fi
 fi
 if [ -x "$SIMNIBS_PYTHON" ]; then
-  RUN_ARGS+=(--simnibs-python "$SIMNIBS_PYTHON")
+  if "$SIMNIBS_PYTHON" -c "import simnibs; print('    SimNIBS', simnibs.__version__)" \
+      < /dev/null; then
+    RUN_ARGS+=(--simnibs-python "$SIMNIBS_PYTHON")
+  else
+    echo "    SimNIBS did not install correctly (see simnibs_install.log); skipping it"
+    RUN_ARGS+=(--no-simnibs)
+  fi
+elif [ "$INSTALL_SIMNIBS" = 1 ]; then
+  echo "    SimNIBS did not install (see simnibs_install.log); skipping it"
 fi
 
 # --- Run -------------------------------------------------------------------
@@ -135,7 +154,12 @@ fi
 [ -n "$PROVIDER" ] && RUN_ARGS+=(--provider "$PROVIDER")
 
 venv/bin/python -m tmswarp.bench run --suite "$SUITE" \
-  --output "$WORK/results" "${RUN_ARGS[@]}" "${EXTRA[@]+"${EXTRA[@]}"}"
+  --output "$WORK/results" "${RUN_ARGS[@]}" "${EXTRA[@]+"${EXTRA[@]}"}" \
+  < /dev/null
 
 touch "$WORK/DONE"
 echo "=== finished: $(date -u +%Y-%m-%dT%H:%M:%SZ); results in $WORK/results ==="
+
+}
+
+main "$@"
