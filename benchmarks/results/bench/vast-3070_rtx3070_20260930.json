@@ -26,7 +26,8 @@
   "suite": "full",
   "simnibs_python": "/home/user/tmswarp-bench/SimNIBS/simnibs_env/bin/python",
   "tmsservice": "/home/user/tmswarp-bench/SlicerTMS/Experiments/TMSService.py",
-  "t_total": 6237.001823641127
+  "t_total": 6237.001823641127,
+  "tmswarp_commit_note": "run at a2ce4bd; the ernie-full-r1 SimNIBS hypre job re-run at fdbd100 to keep its timings"
  },
  "datasets": {
   "sphere3": {
@@ -2399,15 +2400,34 @@
    "t_wall": 4.638919204007834
   },
   {
-   "status": "out-of-memory",
-   "error": "exit code -9\n[ simnibs ] INFO: Assembling FEM Matrix\n[ simnibs ] INFO: 164.07 s to assemble FEM matrix\n[ simnibs ] INFO: Using solver options: hypre\n[ simnibs ] INFO: Time to set up KSP:  28.2704 s\n[ simnibs ] INFO: Time to solve: 146.7550 s\n[ simnibs ] INFO: Time to solve: 145.7614 s\n[ simnibs ] INFO: Time to solve: 145.5077 s",
+   "simnibs": "4.6.0",
+   "solver": "hypre",
+   "cpu_threads": 12,
+   "t_assembly": 175.2797818291001,
+   "t_rhs": 76.96837778994814,
+   "t_setup": 48.54283747007139,
+   "t_solve": {
+    "best": 146.32670889492147,
+    "median": 146.77805535891093,
+    "samples": [
+     148.35689673898742,
+     146.32670889492147,
+     146.77805535891093
+    ]
+   },
+   "n_nodes": 6113619,
+   "n_elements": 35704056,
+   "peak_rss_gb": 13.22,
+   "status": "error",
    "job": {
     "dataset": "ernie-full-r1",
     "dipole": "far",
     "kind": "simnibs",
     "solver": "hypre"
    },
-   "t_wall": 751.1492052818649
+   "error": "exit code 15\n[ simnibs ] INFO: Time to set up KSP:  28.2670 s\n[ simnibs ] INFO: Time to solve: 145.8842 s\n[ simnibs ] INFO: Time to solve: 144.5951 s\n[ simnibs ] INFO: Time to solve: 145.1007 s\n[0]PETSC ERROR: ------------------------------------------------------------------------\n[0]PETSC ERROR: Caught signal number 11 SEGV: Segmentation Violation, probably memory access out of range\n[0]PETSC ERROR: Try option -start_in_debugger or -on_error_attach_debugger\n[0]PETSC ERROR: or see https://petsc.org/release/faq/#valgrind and https://petsc.org/release/faq/\n[0]PETSC ERROR: configure using --with-debugging=yes, recompile, link, and run \n[0]PETSC ERROR: to get more information on the crash.\n[0]PETSC ERROR: Run with -malloc_debug to check if memory corruption is causing the crash.\napplication called MPI_Abort(MPI_COMM_WORLD, 59) - process 0\n[unset]: PMIU_write error; fd=-1 buf=:cmd=abort exitcode=59 message=application called MPI_Abort(MPI_COMM_WORLD, 59) - process 0\n:\nsystem msg for write_line failure : Bad file descriptor",
+   "partial": true,
+   "t_wall": 763.3162836369593
   },
   {
    "status": "error",
