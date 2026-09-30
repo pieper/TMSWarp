@@ -81,9 +81,21 @@ def run(job):
     }
 
 
+def limit_memory(fraction=0.75):
+    """Fail cleanly instead of exhausting the machine's memory."""
+    try:
+        import resource
+        total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        limit = int(fraction * total)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except Exception:
+        pass
+
+
 def main(argv):
     with open(argv[1]) as f:
         job = json.load(f)
+    limit_memory()
     t0 = time.perf_counter()
     try:
         result = run(job)
