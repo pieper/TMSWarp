@@ -19,7 +19,23 @@ import traceback
 import numpy as np
 
 
-def run(job):
+def peak_rss_gb():
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is kilobytes on Linux, bytes on macOS
+        return round(rss / (2**20 if sys.platform != "darwin" else 2**30), 2)
+    except Exception:
+        return None
+
+
+def write(path, result):
+    with open(path + ".part", "w") as f:
+        json.dump(result, f, indent=1)
+    os.replace(path + ".part", path)
+
+
+def run(job, result_path):
     import simnibs
     from simnibs.mesh_tools import mesh_io
     from simnibs.simulation import fem
@@ -62,11 +78,7 @@ def run(job):
         x = system.solve(b)
         times.append(time.perf_counter() - t0)
 
-    v = mesh_io.NodeData(x, "v", mesh=msh)
-    E = -v.gradient().value * 1e3 - dAdt.node_data2elm_data().value
-    np.savez(job["efield"], E=E)
-
-    return {
+    result = {
         "simnibs": simnibs.__version__,
         "solver": option,
         "cpu_threads": os.cpu_count(),
@@ -78,7 +90,17 @@ def run(job):
                     "samples": [float(t) for t in times]},
         "n_nodes": int(msh.nodes.nr),
         "n_elements": int(msh.elm.nr),
+        "peak_rss_gb": peak_rss_gb(),
     }
+    # The timings are safe now; computing the field needs more memory and
+    # may fail on the largest meshes, leaving the job "partial".
+    write(result_path, dict(result, status="partial", job=job))
+
+    v = mesh_io.NodeData(x, "v", mesh=msh)
+    E = -v.gradient().value * 1e3 - dAdt.node_data2elm_data().value
+    np.savez(job["efield"], E=E)
+    result["peak_rss_gb"] = peak_rss_gb()
+    return result
 
 
 def limit_memory(fraction=0.75):
@@ -98,17 +120,21 @@ def main(argv):
     limit_memory()
     t0 = time.perf_counter()
     try:
-        result = run(job)
+        result = run(job, argv[2])
         result["status"] = "ok"
     except MemoryError:
         result = {"status": "out-of-memory", "error": traceback.format_exc()}
     except Exception:
         result = {"status": "error", "error": traceback.format_exc()}
+    if result["status"] != "ok" and os.path.exists(argv[2]):
+        # Keep the timings written before the failure
+        with open(argv[2]) as f:
+            partial = json.load(f)
+        partial["error"] = result.get("error")
+        result = partial
     result["job"] = job
     result["t_job_total"] = time.perf_counter() - t0
-    with open(argv[2] + ".part", "w") as f:
-        json.dump(result, f, indent=1)
-    os.replace(argv[2] + ".part", argv[2])
+    write(argv[2], result)
 
 
 if __name__ == "__main__":

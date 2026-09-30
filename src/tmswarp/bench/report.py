@@ -45,11 +45,13 @@ def machine_name(run):
     return f"{label} ({gpu}{provider})"
 
 
-def _jobs(run, kind, dataset=None, **match):
+def _jobs(run, kind, dataset=None, include_partial=False, **match):
     out = []
     for r in run["jobs"]:
         job = r.get("job", {})
-        if job.get("kind") != kind or r.get("status") != "ok":
+        if job.get("kind") != kind:
+            continue
+        if r.get("status") != "ok" and not (include_partial and r.get("partial")):
             continue
         if dataset and job.get("dataset") != dataset:
             continue
@@ -104,12 +106,13 @@ def render_solves(run):
         if "n_nodes" not in info:
             continue
         size = f"{_count(info['n_nodes'])} nodes, {_count(info['n_elements'])} tets"
-        for r in _jobs(run, "simnibs", name):
+        for r in _jobs(run, "simnibs", name, include_partial=True):
             setup = "factorization" if r["solver"] in ("pardiso", "mumps") else "setup"
             rows.append([name, size, f"SimNIBS {r['simnibs']} {r['solver']}", "CPU",
                          "—", f"{_fmt_time(r['t_assembly'])} + {_fmt_time(r['t_setup'])} {setup}",
                          _fmt_time(r["t_solve"]["best"]), "—",
-                         _fmt(r.get("rdm_vs_reference"))])
+                         _fmt(r.get("rdm_vs_reference"))
+                         + (" (field not computed)" if r.get("partial") else "")])
         for r in _jobs(run, "numpy-direct", name):
             rows.append([name, size, "SciPy direct, float64", "CPU", "—",
                          f"{_fmt_time(r['t_assembly'])} + "
@@ -224,8 +227,8 @@ def render_summary(runs):
             warp = _first(_jobs(run, "warp", name, device=device)) if device else None
             w6 = _warp_run(warp, 1e-6)
             w4 = _warp_run(warp, 1e-4)
-            hypre = _first(_jobs(run, "simnibs", name, solver="hypre"))
-            pardiso = _first(_jobs(run, "simnibs", name, solver="pardiso"))
+            hypre = _first(_jobs(run, "simnibs", name, include_partial=True, solver="hypre"))
+            pardiso = _first(_jobs(run, "simnibs", name, include_partial=True, solver="pardiso"))
             opt = _first(_jobs(run, "optimization", name))
             opt_time = None
             if opt:

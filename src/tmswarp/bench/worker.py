@@ -45,6 +45,17 @@ def sanitize(obj):
     return obj
 
 
+def peak_rss_gb():
+    """Peak resident memory of this process, in GB."""
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is kilobytes on Linux, bytes on macOS
+        return round(rss / (2**20 if sys.platform != "darwin" else 2**30), 2)
+    except Exception:
+        return None
+
+
 def limit_memory(fraction=0.75):
     """Cap this process's address space so that a job that needs more
     memory than the machine has fails cleanly instead of taking the
@@ -406,6 +417,7 @@ def main(argv):
                   "error": traceback.format_exc()}
     result["job"] = job
     result["t_job_total"] = time.perf_counter() - t0
+    result["peak_rss_gb"] = peak_rss_gb()
     tmp = result_path + ".part"
     with open(tmp, "w") as f:
         json.dump(sanitize(result), f, indent=1)

@@ -145,14 +145,20 @@ def run_job(job, timeout, python=None, script=None, env=None):
         for line in output.splitlines():
             if line.startswith("    "):
                 log(line)
+        tail = "\n".join(output.splitlines()[-15:])
         if result_path.exists():
             with open(result_path) as f:
                 result = json.load(f)
         else:
-            tail = "\n".join(output.splitlines()[-15:])
             killed = proc.returncode in (-9, 137)
             result = {"status": "out-of-memory" if killed else "crashed",
                       "error": f"exit code {proc.returncode}\n{tail}", "job": job}
+        if result.get("status") == "partial":
+            # Timings were recorded but the job did not finish
+            killed = proc.returncode in (-9, 137)
+            result["status"] = "out-of-memory" if killed else "error"
+            result["error"] = result.get("error") or f"exit code {proc.returncode}\n{tail}"
+            result["partial"] = True
     except subprocess.TimeoutExpired:
         result = {"status": "timeout", "error": f"exceeded {timeout} s", "job": job}
     result["t_wall"] = time.perf_counter() - t0
@@ -281,6 +287,8 @@ def _slug(text):
 
 def cmd_run(args):
     suite = dict(SUITES[args.suite])
+    if args.simnibs_solvers:
+        suite["simnibs"] = args.simnibs_solvers.split(",")
     datasets = (args.datasets.split(",") if args.datasets else suite["datasets"])
     devices, has_cuda = warp_devices(args.devices)
     simnibs_python = None if args.no_simnibs else find_simnibs_python(args.simnibs_python)
@@ -337,6 +345,9 @@ def cmd_run(args):
 
     jobs = build_jobs(suite, devices, has_cuda, simnibs_python, tmsservice,
                       available)
+    if args.only:
+        kinds = args.only.split(",")
+        jobs = [j for j in jobs if j["kind"] in kinds]
     t_start = time.perf_counter()
     for i, job in enumerate(jobs, 1):
         log(f"[{i}/{len(jobs)}] {_describe(job)}")
@@ -400,6 +411,8 @@ def main(argv=None):
     run.add_argument("--output", default="benchmark-results",
                      help="directory for the result files")
     run.add_argument("--datasets", help="comma-separated; overrides the suite")
+    run.add_argument("--only", help="comma-separated job kinds to run, e.g. warp,simnibs")
+    run.add_argument("--simnibs-solvers", help="comma-separated, e.g. hypre,pardiso")
     run.add_argument("--devices", help="comma-separated Warp devices")
     run.add_argument("--simnibs-python", help="path to SimNIBS's python")
     run.add_argument("--no-simnibs", action="store_true")
