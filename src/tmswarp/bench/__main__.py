@@ -20,9 +20,10 @@ from pathlib import Path
 import numpy as np
 
 from tmswarp.bench import data, machine, report
+from tmswarp.bench.worker import sanitize
 
-# Problems larger than this are not run with Warp on the CPU or with the
-# direct solver unless the suite asks for it: they take minutes to hours.
+# Problems larger than this are not run with the direct solver unless the
+# suite asks for it: they take minutes to hours.
 SLOW_CPU_NODES = 60000
 
 SUITES = {
@@ -31,6 +32,7 @@ SUITES = {
         "rtols": [1e-3, 1e-4, 1e-6],
         "simnibs": ["hypre"],
         "slow_cpu": [],
+        "warp_cpu_nodes": 10000,
         "optimization": ["ernie-lowres"],
         "timeout": 1800,
     },
@@ -40,6 +42,7 @@ SUITES = {
         "rtols": [1e-3, 1e-4, 1e-6],
         "simnibs": ["hypre", "pardiso"],
         "slow_cpu": [],
+        "warp_cpu_nodes": 60000,
         "optimization": ["ernie-lowres", "ernie-full"],
         "timeout": 3600,
     },
@@ -50,6 +53,7 @@ SUITES = {
         "rtols": [1e-3, 1e-4, 1e-5, 1e-6],
         "simnibs": ["hypre", "pardiso"],
         "slow_cpu": ["ernie-lowres"],
+        "warp_cpu_nodes": 60000,
         "optimization": ["ernie-lowres", "ernie-lowres-r1", "ernie-full"],
         "timeout": 4 * 3600,
     },
@@ -177,14 +181,18 @@ def build_jobs(suite, devices, has_cuda, simnibs_python, tmsservice, datasets):
         if slow_ok:
             jobs.append(dict(base, kind="numpy-direct"))
         for device in devices:
-            if device == "cpu" and not slow_ok:
-                continue
             rtols = suite["rtols"]
-            if device == "cpu" and not small:
-                rtols = [1e-4]
+            quick_on_cpu = n_nodes <= suite["warp_cpu_nodes"]
+            if device == "cpu" and not quick_on_cpu:
+                # Warp's CPU path is slow: only where the suite asks for it,
+                # or where there is no GPU and the mesh is still manageable
+                if name in suite["slow_cpu"] or (not has_cuda and small):
+                    rtols = [1e-4]
+                else:
+                    continue
             jobs.append(dict(base, kind="warp", device=device, rtols=rtols,
-                             repeats=3 if device != "cpu" or small else 1,
-                             gradient=device != "cpu" or small))
+                             repeats=3 if device != "cpu" or quick_on_cpu else 1,
+                             gradient=device != "cpu" or quick_on_cpu))
         if simnibs_python:
             for option in suite["simnibs"]:
                 jobs.append(dict(base, kind="simnibs", solver=option))
@@ -254,7 +262,7 @@ def discretization(datasets, dipole="far"):
         row = {"dataset": coarser, "refined": name,
                "rdm": rdm(E_coarse, restricted),
                "mag": mag(E_coarse, restricted)}
-        if tag1 is not None:
+        if tag1 is not None and np.any(tag1 == 2):
             gm = tag1[::8] == 2
             row["rdm_gm"] = rdm(E_coarse[gm], restricted[gm])
             row["mag_gm"] = mag(E_coarse[gm], restricted[gm])
@@ -307,7 +315,7 @@ def cmd_run(args):
     def save():
         tmp = str(out_json) + ".part"
         with open(tmp, "w") as f:
-            json.dump(results, f, indent=1)
+            json.dump(sanitize(results), f, indent=1)
         os.replace(tmp, out_json)
 
     available = []

@@ -154,15 +154,16 @@ def render_resolution(run):
 
     rows = []
     for d in run.get("discretization", []):
-        if "rdm_gm" not in d:
-            continue
-        rows.append([d["dataset"], d["refined"], _fmt(d["rdm"]), _fmt(d["rdm_gm"]),
-                     f"{100 * d['gm_enorm_change_median']:.1f}%",
-                     f"{100 * d['gm_enorm_change_p95']:.1f}%"])
+        has_gm = d.get("rdm_gm") is not None
+        rows.append([d["dataset"], d["refined"], _fmt(d["rdm"]),
+                     _fmt(d.get("rdm_gm")),
+                     f"{100 * d['gm_enorm_change_median']:.1f}%" if has_gm else "—",
+                     f"{100 * d['gm_enorm_change_p95']:.1f}%" if has_gm else "—"])
     if rows:
-        text += "\nChange in the solution when the mesh is refined once more:\n\n"
+        text += ("\nChange in the float64 reference solution when the mesh is "
+                 "refined once more:\n\n")
         text += _table(["Mesh", "Refined mesh", "RDM", "RDM in grey matter",
-                        "Median change of |E| in grey matter",
+                        "Median change of E magnitude in grey matter",
                         "95th percentile"], rows)
     return text
 
@@ -196,7 +197,7 @@ def render_optimization(run):
                          _fmt(sub["enorm_at_target"], ".2f"),
                          _fmt(sub["enorm_at_target_reference"], ".2f")])
     return _table(["Mesh", "Target (mm)", "Time", "Adam iterations",
-                   "|E| at target (V/m)", "Reference |E| (V/m)"], rows)
+                   "E magnitude at target (V/m)", "Reference (V/m)"], rows)
 
 
 def render_failures(run):
@@ -265,7 +266,7 @@ def render(runs):
         parts.append(render_solves(run))
         parts.append("### Accuracy against mesh resolution\n")
         parts.append(render_resolution(run))
-        parts.append("### Gradient of |E| at a target\n")
+        parts.append("### Gradient of the E magnitude at a target\n")
         parts.append(render_gradient(run))
         parts.append("### Coil position optimization\n")
         parts.append(render_optimization(run))

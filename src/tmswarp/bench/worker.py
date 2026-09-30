@@ -29,6 +29,36 @@ def _reference_path(dataset, kind):
     return data.cache_dir() / f"{dataset}.reference-{kind}.npz"
 
 
+def sanitize(obj):
+    """Make a result JSON-safe: NumPy scalars to Python, NaN/inf to None."""
+    if isinstance(obj, dict):
+        return {str(k): sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [sanitize(v) for v in obj]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        value = float(obj)
+        return value if np.isfinite(value) else None
+    return obj
+
+
+def limit_memory(fraction=0.75):
+    """Cap this process's address space so that a job that needs more
+    memory than the machine has fails cleanly instead of taking the
+    machine down.  Not used for GPU jobs: CUDA reserves address space far
+    beyond what it uses."""
+    try:
+        import resource
+        total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        limit = int(fraction * total)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except Exception:
+        pass
+
+
 def _stats(times):
     return {"best": float(min(times)), "median": float(np.median(times)),
             "samples": [float(t) for t in times]}
@@ -43,7 +73,7 @@ def _accuracy(E, dataset, kind, tag1, mesh, position, moment, didt):
         E_ref = np.load(ref_path)["E"]
         out["rdm_vs_reference"] = rdm(E, E_ref)
         out["mag_vs_reference"] = mag(E, E_ref)
-        if tag1 is not None:
+        if tag1 is not None and np.any(tag1 == 2):
             gm = tag1 == 2
             out["rdm_vs_reference_gm"] = rdm(E[gm], E_ref[gm])
             out["mag_vs_reference_gm"] = mag(E[gm], E_ref[gm])
@@ -361,6 +391,8 @@ def main(argv):
     job_path, result_path = argv[1], argv[2]
     with open(job_path) as f:
         job = json.load(f)
+    if job["kind"] in ("reference", "scipy-cg", "numpy-direct"):
+        limit_memory()
     t0 = time.perf_counter()
     try:
         result = run(job)
@@ -374,7 +406,7 @@ def main(argv):
     result["t_job_total"] = time.perf_counter() - t0
     tmp = result_path + ".part"
     with open(tmp, "w") as f:
-        json.dump(result, f, indent=1)
+        json.dump(sanitize(result), f, indent=1)
     os.replace(tmp, result_path)
 
 
