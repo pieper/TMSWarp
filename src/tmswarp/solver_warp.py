@@ -23,6 +23,8 @@ Notes
   using the solver.
 """
 
+import functools
+
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -217,6 +219,23 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Device handling
+# ---------------------------------------------------------------------------
+# warp.fem allocates on Warp's default device unless told otherwise, so a
+# requested device of "cpu" would be ignored on a machine with CUDA.  All
+# work is therefore done with the requested device as the scoped default.
+
+def _on_context_device(method):
+    """Run a WarpFEMContext method with the context's device as default."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        import warp as wp
+        with wp.ScopedDevice(self._device):
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
 # Gauge projector helper
 # ---------------------------------------------------------------------------
 
@@ -293,12 +312,22 @@ def solve_fem_warp(
     _init_warp()
 
     import warp as wp
-    import warp.fem as fem
-    from warp.examples.fem.utils import bsr_cg
 
     # Default to warp's preferred device (cuda:0 if GPU available, else cpu)
     if device is None:
         device = wp.get_preferred_device()
+
+    with wp.ScopedDevice(device):
+        return _solve_fem_warp(
+            mesh, dAdt_nodes, pin_node, device, quiet, tol, max_iters
+        )
+
+
+def _solve_fem_warp(mesh, dAdt_nodes, pin_node, device, quiet, tol, max_iters):
+    """Body of solve_fem_warp(); runs with ``device`` as Warp's default."""
+    import warp as wp
+    import warp.fem as fem
+    from warp.examples.fem.utils import bsr_cg
 
     # ------------------------------------------------------------------
     # Build warp.fem geometry  (Tetmesh requires float32 positions)
@@ -424,6 +453,13 @@ class WarpFEMContext:
         if device is None:
             device = wp.get_preferred_device()
 
+        with wp.ScopedDevice(device):
+            self._build(mesh, pin_node, device, tol)
+
+    def _build(self, mesh, pin_node, device, tol):
+        import warp as wp
+        import warp.fem as fem
+
         # Build geometry
         positions = wp.array(
             mesh.nodes.astype(np.float32), dtype=wp.vec3f, device=device
@@ -505,6 +541,7 @@ class WarpFEMContext:
         )
         self._dAdt_wp = None  # set by set_rhs()
 
+    @_on_context_device
     def set_rhs(self, dAdt_nodes):
         """Assemble new RHS b for updated dA/dt.  Keep x for warm start."""
         import warp as wp
@@ -534,6 +571,7 @@ class WarpFEMContext:
         self._total_iters = 0
         self._converged = False
 
+    @_on_context_device
     def step(self, n_iters=50):
         """Run n_iters CG iterations from current x.
 
@@ -560,6 +598,7 @@ class WarpFEMContext:
         wp.synchronize_device(self._device)
         return self.x.numpy().astype(np.float64)
 
+    @_on_context_device
     def compute_enorm(self):
         """Compute |E| per element entirely on GPU.
 
@@ -587,6 +626,7 @@ class WarpFEMContext:
     # Differentiable objective (wp.Tape + adjoint linear solve)
     # ------------------------------------------------------------------
 
+    @_on_context_device
     def _ensure_diff_state(self):
         """Allocate the arrays recorded on the tape (one-time)."""
         if self._diff_ready:
@@ -614,6 +654,7 @@ class WarpFEMContext:
         self._lam_target = None
         self._diff_ready = True
 
+    @_on_context_device
     def _solve_relative(self, b, x, rtol, max_iters):
         """Solve K x = b to a residual of ``rtol * |b|``, warm-started from x.
 
@@ -646,6 +687,7 @@ class WarpFEMContext:
         wp.synchronize_device(dev)
         return float(err), int(iters)
 
+    @_on_context_device
     def solve(self, dAdt_nodes, rtol=1e-4, max_iters=2000):
         """set_rhs() then solve to a relative residual, warm-started from x.
 
@@ -658,6 +700,7 @@ class WarpFEMContext:
         self._converged = err <= rtol
         return err, iters, self._converged
 
+    @_on_context_device
     def objective_and_gradient(self, dipole_pos, dipole_moment, target_elem,
                                didt=1e6, rtol=1e-4, max_iters=2000):
         """Evaluate loss = -|E[target_elem]| and its gradient by autodiff.
